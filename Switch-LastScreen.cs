@@ -1,8 +1,9 @@
-// Elevated helper of the automatic mode. Install-Auto.ps1 compiles it to "%ProgramFiles%\LockMonitor\Switch-LastScreen.exe"
-// and has Windows start it on its own lock and unlock events. It does one thing: at lock it takes the highest-numbered
-// screen off the Windows desktop (-take), at unlock it puts it back (-give). It uses the documented switch behind
+// Elevated helper. Install-Auto.ps1 compiles it to "%ProgramFiles%\LockMonitor\Switch-LastScreen.exe" and has Windows
+// start it on its own lock and unlock events. It does one thing: at lock it takes the highest-numbered screen off the
+// Windows desktop (-take), at unlock it puts it back (-give). It uses the documented switch behind
 // Settings > System > Display > Advanced display > "Remove display from desktop". The lock itself is not touched and
-// nothing else runs elevated: the picture is produced by Show-Dashboard.ps1 -Auto, unelevated.
+// nothing else runs elevated: the picture is produced by LockMonitor-Agent.exe (Agent.cs), unelevated.
+// Its log (switch.log next to it) has only what is out of the ordinary; the routine is in the agent's log.
 //
 // It is a program of its own, not a script, on purpose: it runs elevated on every lock, so it should start in
 // milliseconds and depend on nothing a non-administrator can change (no script host, no module or temp folders, no
@@ -57,6 +58,12 @@ static class SwitchLastScreen {
         GetReq r = new GetReq(); r.type = 12; r.size = Marshal.SizeOf(typeof(GetReq)); r.lo = lo; r.hi = hi; r.id = id;
         if (GetSpecialization(ref r) != 0) return null;
         return (r.flags & 1) != 0;
+    }
+    // What Windows itself says about handing that screen to a program (the other two bits of the same answer).
+    static string Possible(uint lo, int hi, uint id) {
+        GetReq r = new GetReq(); r.type = 12; r.size = Marshal.SizeOf(typeof(GetReq)); r.lo = lo; r.hi = hi; r.id = id;
+        if (GetSpecialization(ref r) != 0) return "unknown";
+        return "this monitor " + ((r.flags & 2) != 0 ? "yes" : "no") + ", this Windows " + ((r.flags & 4) != 0 ? "yes" : "no");
     }
 
     // Windows' list of display paths: 1 = all possible ones (QDC_ALL_PATHS), 2 = those of the desktop (QDC_ONLY_ACTIVE_PATHS).
@@ -137,9 +144,8 @@ static class SwitchLastScreen {
         }
         int rc = Set(lo, hi, id, true);
         if (rc != 0) { Log("take: Windows refused " + device + ", error " + rc); return; }
-        k.SetValue("Taken", lo + "|" + hi + "|" + id + "|" + device + "|" + path);
+        k.SetValue("Taken", lo + "|" + hi + "|" + id + "|" + device + "|" + path);   // the routine case is not logged here: the agent's log has it
         if (keep == null) k.SetValue("Keep", path);
-        Log("take: " + device + " is off the desktop");
         // Unlocked again while this ran? The unlock event's -give waits for this run to finish, so it would put the
         // screen back anyway; doing it here returns the screen a moment sooner and does not depend on that second start.
         if (!force && !Locked()) { Log("take: the PC was unlocked meanwhile"); Give(k); }
@@ -153,7 +159,7 @@ static class SwitchLastScreen {
         for (int i = 0; i < 40; i++) {   // 10 s: the picture program lets go of the screen within a fraction of a second after the unlock
             rc = Set(lo, hi, id, false);
             bool? off = OffDesktop(lo, hi, id);
-            if (rc == 0 || off == false) { k.DeleteValue("Taken", false); Log("give: " + h[3] + " is back on the desktop"); return; }
+            if (rc == 0 || off == false) { k.DeleteValue("Taken", false); return; }
             if (off == null) {   // unplugged or switched off: nothing to wait for. Windows remembers "off the desktop" for it (measured), so the note stays.
                 Log("give: " + h[3] + " is not connected right now (error " + rc + "). It is put back as soon as it is there again");
                 return;
@@ -171,7 +177,7 @@ static class SwitchLastScreen {
                 uint lo, id; int hi; string device, keep; int screens = LastScreen(out lo, out hi, out id, out device);
                 using (RegistryKey hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64))
                 using (RegistryKey k = hklm.OpenSubKey(@"SOFTWARE\LockMonitor")) keep = k == null ? null : k.GetValue("Keep") as string;
-                Console.WriteLine(screens + " screen(s) on the desktop; highest-numbered: " + (device ?? "none") + (device == null ? "" : "  (adapter " + hi + ":" + lo + ", target " + id + ", off the desktop now: " + OffDesktop(lo, hi, id) + ")") + "; PC locked: " + Locked()
+                Console.WriteLine(screens + " screen(s) on the desktop; highest-numbered: " + (device ?? "none") + (device == null ? "" : "  (adapter " + hi + ":" + lo + ", target " + id + ", off the desktop now: " + OffDesktop(lo, hi, id) + ", can be handed to a program: " + Possible(lo, hi, id) + ")") + "; PC locked: " + Locked()
                     + "; screen kept at lock: " + (keep == null ? "the one taken at the next lock" : device != null && keep == MonitorPath(lo, hi, id) ? "this one" : "not this one but " + keep));
                 return 0;
             }

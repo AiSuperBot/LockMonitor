@@ -1,0 +1,12 @@
+<!-- Test page: says, live, how wide the browser lays the page out and at which scaling it draws. Open it maximized on the screen under test. -->
+<title>scale-page</title>
+<body style="font:40px sans-serif;background:#102040;color:white;margin:30px">
+<div>scale test</div><div id=a></div><div id=b></div><div id=c></div>
+<div style="margin-top:30px;width:600px;height:60px;background:#3a7">600 px wide bar</div>
+<script>
+setInterval(() => {
+  a.textContent = "page width " + innerWidth + " px, height " + innerHeight + " px";
+  b.textContent = "drawn at " + Math.round(devicePixelRatio * 100) + "%";
+  c.textContent = new Date().toLocaleTimeString();
+}, 500);
+</script>

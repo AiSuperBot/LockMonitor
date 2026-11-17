@@ -5,7 +5,10 @@ so start this before the lock (-After) to have it act during the lock.
 #>
 param([int]$After = 0, [int]$Screens = 2)
 Start-Sleep $After
-# one screen is asked for in another size than usual: asked for the layout the desktop already has (the second screen being off the desktop), the tool does nothing
-$layout = switch ($Screens) { 1 { '0 1 , 0 0 1024 768' } 3 { '0 3 , 0 0 1280 800 , 1280 0 1280 800 , 2560 0 1024 768' } default { '0 2 , 0 0 1280 800 , 1280 0 1280 800' } }
+Add-Type -AssemblyName System.Windows.Forms
+# VMware's tool does nothing when asked for the layout the desktop already has (which is the case while the second
+# screen is off the desktop). So one screen is asked for in a size the first screen does not have right now.
+$one = if ([Windows.Forms.Screen]::PrimaryScreen.Bounds.Width -eq 1024) { '1152 864' } else { '1024 768' }
+$layout = switch ($Screens) { 1 { "0 1 , 0 0 $one" } 3 { '0 3 , 0 0 1280 800 , 1280 0 1280 800 , 2560 0 1024 768' } default { '0 2 , 0 0 1280 800 , 1280 0 1280 800' } }
 & 'C:\Program Files\VMware\VMware Tools\VMwareResolutionSet.exe' ($layout -split ' ') | Out-Null
-Add-Content C:\locktest\screens.log ('{0:HH:mm:ss} asked VMware for {1} screen(s), exit code {2}' -f (Get-Date), $Screens, $LASTEXITCODE)
+Add-Content C:\locktest\screens.log ('{0:HH:mm:ss} asked VMware for {1} screen(s) ({2}), exit code {3}' -f (Get-Date), $Screens, $layout, $LASTEXITCODE)
