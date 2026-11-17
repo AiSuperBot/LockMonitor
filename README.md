@@ -4,7 +4,7 @@ Press **Win+L** and one monitor keeps showing its windows, live, while Windows i
 
 The lock is the genuine Windows lock. No Windows file is patched, Win+L is not intercepted, there is no imitation lock screen, and signing in works exactly as before. The kept monitor shows pictures only: it has no cursor, no keyboard focus and takes no input.
 
-**Status: pre-release.** The whole flow has been tested in a virtual machine with real Win+L presses and real password unlocks, on two and three screens. One step is not confirmed on real hardware yet: putting the picture onto a real monitor through a real graphics card. The VM's virtual graphics driver cannot do that step, so there the pictures were written to files. The first real attempt (a laptop with a TV on HDMI, version 0.1.0) stopped just before that step; 0.1.1 fixes what stopped it. Details under [Tested and not tested](#tested-and-not-tested).
+**Status: pre-release.** The whole flow has been tested in a virtual machine with real Win+L presses and real password unlocks, on two and three screens. One step is not confirmed on real hardware yet: putting the picture onto a real monitor through a real graphics card. The VM's virtual graphics driver cannot do that step, so there the pictures were written to files. The first real attempts (a laptop with a TV on HDMI) ended before that step: the PC was unlocked again two seconds after Win+L. Details under [Tested and not tested](#tested-and-not-tested).
 
 ## Requirements
 
@@ -65,11 +65,12 @@ After setup, this shows which screen it would be, without changing anything:
 
 ## Good to know
 
+- At Win+L the kept monitor goes blank first. In the test VM the picture came about 3 seconds after Win+L; a TV also has to find its signal again. Leave it locked for at least 15 seconds before judging.
 - While locked, the PC is kept awake and the displays are kept on. Windows has one display-power switch for all monitors, so the other monitors stay lit, showing the lock screen.
 - Apps must keep drawing while the PC is locked. Classic apps do. Chrome and Edge do with the policy above. Apps built on Electron may freeze; there is no switch for them from outside.
 - The picture is refreshed up to four times a second while it changes, and once a second while it is still.
 - If none of the screen's windows can be drawn, the screen says why instead of staying black.
-- Logs: `%LOCALAPPDATA%\LockMonitor\log.txt` and `%ProgramFiles%\LockMonitor\switch.log`. For every lock they say what was noted, which screen was taken, how many pictures were shown, and anything that went wrong.
+- Logs: `%LOCALAPPDATA%\LockMonitor\log.txt` and `%ProgramFiles%\LockMonitor\switch.log`. For every lock they say what was noted, which screen was taken, how many pictures were shown, how the lock ended, and anything that went wrong.
 
 ## Tested and not tested
 

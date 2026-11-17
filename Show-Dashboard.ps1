@@ -73,8 +73,10 @@ if ($Install) {   # optional convenience: start by itself at logon. Nothing is i
     Copy-Item $PSCommandPath $dir -Force   # the task runs this private copy, not a folder other users may write to
     $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $what = if ($Window) { "-Window `"$Window`"" } else { "-Url `"$Url`"$(if ($ShowBrowser) { ' -ShowBrowser' })" }
-    # through "conhost --headless": where Windows Terminal is the console host, -WindowStyle Hidden alone leaves a terminal window open (measured)
-    $act = New-ScheduledTaskAction -Execute conhost.exe -Argument "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dir\Show-Dashboard.ps1`" $what$(if ($LetDisplaysSleep) { ' -LetDisplaysSleep' })"
+    # through "conhost --headless": where Windows Terminal is the console host, -WindowStyle Hidden alone leaves a terminal window open (measured).
+    # Full paths: a task that is stored and started at every logon must not depend on the search path.
+    $sys = [Environment]::GetFolderPath('System')
+    $act = New-ScheduledTaskAction -Execute "`"$sys\conhost.exe`"" -Argument "--headless `"$sys\WindowsPowerShell\v1.0\powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dir\Show-Dashboard.ps1`" $what$(if ($LetDisplaysSleep) { ' -LetDisplaysSleep' })"
     $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1)
     $who = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited   # normal token, in the user's session
     Register-ScheduledTask LockMonitor-Dashboard -Force -Action $act -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $me) -Principal $who -Settings $set | Out-Null
@@ -179,8 +181,20 @@ public static class Pix {
     // Windows' own lock flag: WTSSessionInfoEx (25), SessionFlags at offset 16, 0 = locked, 1 = unlocked. Whether the input
     // desktop can be opened is no test: Windows draws the lock-screen picture on the user's own desktop (measured in the test VM).
     static int Flags() { IntPtr p; int n; if (!WTSQuerySessionInformation(IntPtr.Zero, -1, 25, out p, out n)) return -1; int f = Marshal.ReadInt32(p, 16); WTSFreeMemory(p); return f; }
+    // Both are definite answers: when Windows cannot say (the query fails, or the flag is neither), the PC counts as
+    // neither locked nor unlocked, and whoever asks carries on as before.
     public static bool Locked() { return Flags() == 0; }
+    public static bool Unlocked() { return Flags() == 1; }
     public static string SessionState() { int f = Flags(); return f == 0 ? "LOCKED" : f == 1 ? "unlocked" : "unknown"; }
+
+    [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize, dwTime; }
+    [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO i);
+    // Seconds since keyboard or mouse were last used. It also counts input made on the lock screen (measured in the test
+    // VM), so at an unlock it tells a typed password or PIN from a sign-in without typing (face, fingerprint).
+    public static double IdleSeconds() {
+        LASTINPUTINFO i = new LASTINPUTINFO(); i.cbSize = 8;
+        return GetLastInputInfo(ref i) ? unchecked((uint)Environment.TickCount - i.dwTime) / 1000.0 : 0;
+    }
 
     // The screen Switch-LastScreen.exe holds off the desktop right now, as "adapterLow|adapterHigh|target|device|monitor path"; null if none.
     public static string Taken() {
@@ -339,7 +353,7 @@ public static class Pix {
             if (timeoutMs > 0 && sw.ElapsedMilliseconds >= timeoutMs) return null;
             string held = Taken();
             if (held == null) { kept = 0; noted = latest; latest = Snapshot(); }
-            else if (++kept >= 8 && AskToGiveBack(held)) kept = -7;   // asked: allow 10 s before asking again
+            else if (++kept >= 8 && Unlocked() && AskToGiveBack(held)) kept = -7;   // asked: allow 10 s before asking again
             Thread.Sleep(700);
         }
         return noted ?? latest ?? new Snap();
@@ -363,10 +377,10 @@ public static class Pix {
     // And do not sit on a screen-sized bitmap until the next lock.
     public static void LockEnded() { latest = noted; if (scratch != null) { scratch.Dispose(); scratch = null; } }
 
-    // Sleeps ms, but returns false at once when the PC is no longer locked: the screen must go back without delay.
+    // Sleeps ms, but returns false at once when the PC has been unlocked: the screen must go back without delay.
     public static bool SleepWhileLocked(int ms) {
         for (int left = ms; ; left -= 100) {
-            if (!Locked()) return false;
+            if (Unlocked()) return false;
             if (left <= 0) return true;
             Thread.Sleep(Math.Min(100, left));
         }
@@ -903,8 +917,8 @@ if ($Auto) {
             $noted = [Pix]::WaitForLock($(if ($Seconds) { [int][math]::Min([int]::MaxValue, [math]::Max(1, ($stopAt - (Get-Date)).TotalMilliseconds)) } else { 0 }))
             if (-not $noted) { break }   # only with -Seconds: time is up
             Log ('auto: locked; {0} window(s) noted on {1} {2}x{3}' -f $noted.Wins.Count, $noted.Device, $noted.W, $noted.H)
-            $fails = 0; $early = @{}; $since = $null
-            while ([Pix]::Locked() -and (Get-Date) -lt $stopAt) {
+            $fails = 0; $early = @{}; $since = $null; $lockedAt = Get-Date
+            while (-not [Pix]::Unlocked() -and (Get-Date) -lt $stopAt) {
                 $held = [Pix]::Taken()
                 # nothing to do until the helper has freed the screen (it never does on a single-screen desktop): wait cheaply
                 if (-not $held) { Start-Sleep -Milliseconds 250; continue }
@@ -924,7 +938,9 @@ if ($Auto) {
                     $null = [Pix]::SleepWhileLocked(1000 * [math]::Min(60, 2 * $fails))   # try again after 2 s, 4 s, ... at most a minute: no busy loop, no flood in the log
                 }
             }
-            Log 'auto: unlocked'
+            # how the lock ended belongs in the log: a lock that is over within seconds never gets as far as a picture
+            $lasted = ((Get-Date) - $lockedAt).TotalSeconds; $idle = [Pix]::IdleSeconds()
+            Log ('auto: unlocked after {0:N0} s; {1}' -f $lasted, $(if ($idle -ge $lasted) { 'keyboard and mouse were not used during the lock, so the sign-in was not typed (face, fingerprint or similar)' } else { 'keyboard or mouse were used during the lock' }))
             [Pix]::LockEnded()
         } catch {
             # Nothing outside restarts this program: it is started through a console host that hides its exit code from

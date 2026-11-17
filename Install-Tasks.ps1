@@ -19,8 +19,10 @@ $who = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel L
 $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
 
 function Reg($name, $scriptArgs, $triggers) {
-    # through "conhost --headless": where Windows Terminal is the console host, -WindowStyle Hidden alone still pops up a window (measured)
-    $act = New-ScheduledTaskAction -Execute conhost.exe -Argument "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dir\Set-LockMonitor.ps1`" $scriptArgs"
+    # through "conhost --headless": where Windows Terminal is the console host, -WindowStyle Hidden alone still pops up a window (measured).
+    # Full paths: a task that is stored and started at every lock must not depend on the search path.
+    $sys = [Environment]::GetFolderPath('System')
+    $act = New-ScheduledTaskAction -Execute "`"$sys\conhost.exe`"" -Argument "--headless `"$sys\WindowsPowerShell\v1.0\powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dir\Set-LockMonitor.ps1`" $scriptArgs"
     Register-ScheduledTask -TaskName $name -Force -Action $act -Trigger $triggers -Principal $who -Settings $set | Out-Null
 }
 Reg LockMonitor-Lock "-Action Lock -KioskInput $KioskInput" (OnState 7)
