@@ -73,7 +73,8 @@ if ($Install) {   # optional convenience: start by itself at logon. Nothing is i
     Copy-Item $PSCommandPath $dir -Force   # the task runs this private copy, not a folder other users may write to
     $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $what = if ($Window) { "-Window `"$Window`"" } else { "-Url `"$Url`"$(if ($ShowBrowser) { ' -ShowBrowser' })" }
-    $act = New-ScheduledTaskAction -Execute powershell.exe -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dir\Show-Dashboard.ps1`" $what$(if ($LetDisplaysSleep) { ' -LetDisplaysSleep' })"
+    # through "conhost --headless": where Windows Terminal is the console host, -WindowStyle Hidden alone leaves a terminal window open (measured)
+    $act = New-ScheduledTaskAction -Execute conhost.exe -Argument "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dir\Show-Dashboard.ps1`" $what$(if ($LetDisplaysSleep) { ' -LetDisplaysSleep' })"
     $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1)
     $who = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited   # normal token, in the user's session
     Register-ScheduledTask LockMonitor-Dashboard -Force -Action $act -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $me) -Principal $who -Settings $set | Out-Null
@@ -426,6 +427,7 @@ public class Gfx : IDisposable {
     delegate void FnUnmap(IntPtr self, IntPtr res, uint sub);
     delegate void FnEnd(IntPtr self, IntPtr asyncObj);
     delegate int FnData(IntPtr self, IntPtr asyncObj, out int data, uint size, uint flags);
+    delegate void FnTexDesc(IntPtr self, out TexDesc d);
 
     [DllImport("dxgi.dll")] static extern int CreateDXGIFactory1(ref Guid riid, out IntPtr factory);
     [DllImport("d3d11.dll")] static extern int D3D11CreateDevice(IntPtr adapter, int driverType, IntPtr software, uint flags, IntPtr levels, uint nLevels, uint sdk, out IntPtr dev, out int level, out IntPtr ctx);
@@ -492,7 +494,7 @@ public class Gfx : IDisposable {
     // texture shared by NT handle (as a DisplaySurface is) -> upload two known pixels -> read back through a staging texture
     public string SelfTest() {
         TexDesc d = new TexDesc(); d.W = 64; d.H = 32; d.Mips = 1; d.ArraySize = 1; d.Format = 87; d.SampCount = 1; d.Bind = 0x20; d.Misc = 0x2 | 0x800;
-        IntPtr tex, res1, h, st;
+        IntPtr tex, res1, h;
         Check(createTex(dev, ref d, IntPtr.Zero, out tex), "CreateTexture2D");
         Guid iidRes1 = new Guid("30961379-4609-4a41-998e-54fe567ee0c1");
         Check(Slot<FnQI>(tex, 0)(tex, ref iidRes1, out res1), "IDXGIResource1");
@@ -503,15 +505,30 @@ public class Gfx : IDisposable {
             b.SetPixel(5, 7, Color.FromArgb(255, 200, 100, 50));
             Upload(opened, b);
         }
-        TexDesc s = d; s.Usage = 3; s.Bind = 0; s.Cpu = 0x20000; s.Misc = 0;   // STAGING, CPU read
-        Check(createTex(dev, ref s, IntPtr.Zero, out st), "CreateTexture2D(staging)");
-        copy(ctx, st, opened);
-        Mapped m; Check(map(ctx, st, 0, 1, 0, out m), "Map");
-        int p0 = Marshal.ReadInt32(m.Data, 0), p1 = Marshal.ReadInt32(m.Data, (int)(7 * m.RowPitch) + 5 * 4);
-        unmap(ctx, st, 0);
-        Release(st); Release(opened); Release(res1); Release(tex);
+        int p0 = ReadPixel(opened, 0, 0), p1 = ReadPixel(opened, 5, 7);
+        Release(opened); Release(res1); Release(tex);
         bool ok = p0 == unchecked((int)0xFF0A141E) && p1 == unchecked((int)0xFFC86432);
         return (ok ? "OK" : "FAILED") + " (pixels 0x" + p0.ToString("X8") + " / 0x" + p1.ToString("X8") + ")";
+    }
+
+    // What kind of texture this is (ID3D11Texture2D::GetDesc, slot 10): for the log, when a display surface misbehaves.
+    public string Describe(IntPtr tex) {
+        TexDesc d; Slot<FnTexDesc>(tex, 10)(tex, out d);
+        return d.W + "x" + d.H + " format " + d.Format + " usage " + d.Usage + " bind 0x" + d.Bind.ToString("X") + " misc 0x" + d.Misc.ToString("X");
+    }
+
+    // One pixel of a texture, read back through a staging copy: the proof that an upload arrived.
+    public int ReadPixel(IntPtr tex, int x, int y) {
+        TexDesc d; Slot<FnTexDesc>(tex, 10)(tex, out d);
+        d.Mips = 1; d.ArraySize = 1; d.SampCount = 1; d.SampQuality = 0; d.Usage = 3; d.Bind = 0; d.Cpu = 0x20000; d.Misc = 0;   // STAGING, CPU read
+        IntPtr st; Check(createTex(dev, ref d, IntPtr.Zero, out st), "CreateTexture2D(staging)");
+        try {
+            copy(ctx, st, tex);
+            Mapped m; Check(map(ctx, st, 0, 1, 0, out m), "Map");
+            int p = Marshal.ReadInt32(m.Data, (int)(y * m.RowPitch) + x * 4);
+            unmap(ctx, st, 0);
+            return p;
+        } finally { Release(st); }
     }
 
     public void Dispose() { Release(query); Release(ctx); Release(dev1); Release(dev); query = ctx = dev1 = dev = IntPtr.Zero; }
@@ -684,8 +701,11 @@ if ($SelfTest) {
         $dev = $dm.CreateDisplayDevice($t.Adapter)
         $tex = $g.OpenSurface($dev, $dev.CreatePrimary($t, $desc))
         $f = New-Object Frame(256, 128)
-        $g.Upload($tex, $f.Bits, $f.Stride); [Gfx]::Free($tex); $f.Dispose()
-        'DisplaySurface -> D3D11 texture -> upload: OK'
+        $gr = [Drawing.Graphics]::FromImage($f.Gdi); $gr.Clear([Drawing.Color]::FromArgb(200, 100, 50)); $gr.Dispose()
+        $g.Upload($tex, $f.Bits, $f.Stride)
+        $px = $g.ReadPixel($tex, 100, 60)   # the picture must really be in the display surface, not merely have been sent
+        'DisplaySurface -> D3D11 texture -> upload -> readback: ' + (Verdict (($px -band 0xFFFFFF) -eq 0xC86432) ('pixel 0x{0:X8}' -f $px)) + '   (surface: ' + $g.Describe($tex) + ')'
+        [Gfx]::Free($tex); $f.Dispose()
         'not testable here: acquire/apply/scanout need an owned specialized display (first checked by -Pattern)'
     } catch { 'DisplaySurface -> D3D11 texture -> upload: FAILED ' + $_.Exception.Message.Trim() + '  => this display driver cannot scan out for this script (it takes a current WDDM 2.x driver; VMware''s virtual GPU fails here)' }
     $mk = { param($w, $h, $n, $d) [pscustomobject]@{ SourceResolution = [pscustomobject]@{ Width = $w; Height = $h }; PresentationRate = [pscustomobject]@{ VerticalSyncRate = [pscustomobject]@{ Numerator = $n; Denominator = $d } } } }
@@ -802,7 +822,7 @@ function Show-Pictures {
             $surf = foreach ($i in 0, 1) { $dev.CreatePrimary($t, $desc) }
             $scan = foreach ($s in $surf) { $dev.CreateSimpleScanout($src, $s, 0, 1) }
             foreach ($s in $surf) { $tex += $gfx.OpenSurface($dev, $s) }
-            Log ('acquired {0} ({1}x{2}) on {3}' -f $t.StableMonitorId, $w, $h, $gfx.AdapterName)
+            Log ('acquired {0} ({1}x{2}) on {3}; surface {4}' -f $t.StableMonitorId, $w, $h, $gfx.AdapterName, $gfx.Describe($tex[0]))
         }
 
         if ($Url -and -not $Pattern -and -not $Window -and -not $Auto) {
@@ -815,14 +835,20 @@ function Show-Pictures {
         $frame = New-Object Frame($w, $h)
         $end = if ($Auto) { $stopAt } elseif ($Seconds) { (Get-Date).AddSeconds($Seconds) } else { [datetime]::MaxValue }
         $beatEvery = if ($Pattern -or $FramesTo) { 1 } else { 10 }   # the heartbeat file is for tests; in daily use do not write to disk every second
-        $i = 0; $n = 0; $still = 0; $beat = [datetime]::MinValue
+        $i = 0; $n = 0; $still = 0; $said = $false; $beat = [datetime]::MinValue
         while ((Get-Date) -lt $end) {
             if ($cdp) {   # Chrome reports a new picture by itself, only when the page changed
                 $j = $cdp.NextJpeg(1000); $fresh = [bool]$j
                 if ($fresh) { [Pix]::Decode($j, $frame) }
             } else {
                 if ($Auto) {
-                    if ($noted.Wins.Count) { $null = [Pix]::CaptureWindows($noted, $frame) } else { [Pix]::Notice($frame, 'Nothing was open on this screen when the PC was locked') }
+                    $drawn = if ($noted.Wins.Count) { [Pix]::CaptureWindows($noted, $frame) } else { 0 }
+                    if (-not $drawn) {   # say why the screen is empty, on the screen itself and once in the log
+                        $why = if (-not $noted.Wins.Count) { 'Nothing was open on this screen when the PC was locked' }
+                               else { "The windows of this screen cannot be shown:`nWindows minimized them when the screen left the desktop, or they were closed.`nIf they were minimized: sign out and back in once. The setup changed a Windows`nsetting for that, and it takes effect only at sign-in." }
+                        [Pix]::Notice($frame, $why)
+                        if (-not $said) { $said = $true; Log ('auto: no window picture ({0} window(s) noted): {1}' -f $noted.Wins.Count, ($why -replace "`n", ' ')) }
+                    }
                 } elseif ($Window -and -not $Pattern) {
                     if ($hwnd -eq [IntPtr]::Zero) { $hwnd = [Pix]::FindWindow($Window) }
                     $st = if ($hwnd -eq [IntPtr]::Zero) { 'gone' } else { [Pix]::CaptureWindow($hwnd, $frame) }
@@ -854,6 +880,7 @@ function Show-Pictures {
             }
         }
     } finally {
+        if ($Auto -and $n) { Log "auto: $n picture(s) shown" }
         $null = [Pwr]::Keep($false, $false)
         if ($cdp) { $cdp.Dispose() }
         foreach ($x in $tex) { [Gfx]::Free($x) }
@@ -870,26 +897,42 @@ if ($Auto) {
     # Then the helper puts the screen back.
     [Pix]::DpiAware()
     $stopAt = if ($Seconds) { (Get-Date).AddSeconds($Seconds) } else { [datetime]::MaxValue }
-    Log 'auto: waiting for the PC to be locked'
+    try { Log 'auto: waiting for the PC to be locked' } catch { }
     while ((Get-Date) -lt $stopAt) {
-        $noted = [Pix]::WaitForLock($(if ($Seconds) { [int][math]::Min([int]::MaxValue, [math]::Max(1, ($stopAt - (Get-Date)).TotalMilliseconds)) } else { 0 }))
-        if (-not $noted) { break }   # only with -Seconds: time is up
-        $fails = 0; $misses = 0
-        while ([Pix]::Locked() -and (Get-Date) -lt $stopAt) {
-            $held = [Pix]::Taken()
-            # nothing to do until the helper has freed the screen (it never does on a single-screen desktop): wait cheaply
-            if (-not $held) { Start-Sleep -Milliseconds 250; continue }
-            $ran = [Diagnostics.Stopwatch]::StartNew()
-            try { Run }
-            catch {
-                # freed a moment ago: not visible to this API yet, or Windows has not let go of it yet (both measured). Ask again at once, quietly.
-                if ("$_" -match 'No connected specialized display|TargetAccessDenied' -and ++$misses -le 50) { Start-Sleep -Milliseconds 200; continue }
-                if ($ran.Elapsed.TotalSeconds -gt 60) { $fails = 0 }   # it had been working: a new problem, not the old one again
-                $fails++; Log "auto: $_"
-                $null = [Pix]::SleepWhileLocked(1000 * [math]::Min(60, 2 * $fails))   # try again after 2 s, 4 s, ... at most a minute: no busy loop, no flood in the log
+        try {
+            $noted = [Pix]::WaitForLock($(if ($Seconds) { [int][math]::Min([int]::MaxValue, [math]::Max(1, ($stopAt - (Get-Date)).TotalMilliseconds)) } else { 0 }))
+            if (-not $noted) { break }   # only with -Seconds: time is up
+            Log ('auto: locked; {0} window(s) noted on {1} {2}x{3}' -f $noted.Wins.Count, $noted.Device, $noted.W, $noted.H)
+            $fails = 0; $early = @{}; $since = $null
+            while ([Pix]::Locked() -and (Get-Date) -lt $stopAt) {
+                $held = [Pix]::Taken()
+                # nothing to do until the helper has freed the screen (it never does on a single-screen desktop): wait cheaply
+                if (-not $held) { Start-Sleep -Milliseconds 250; continue }
+                if (-not $since) { $since = [Diagnostics.Stopwatch]::StartNew() }
+                $ran = [Diagnostics.Stopwatch]::StartNew()
+                try { Run }
+                catch {
+                    if ($ran.Elapsed.TotalSeconds -gt 60) { $fails = 0; $early.Clear(); $since.Restart() }   # it had been working: a new problem, not the old one again
+                    # For the first moments after the screen left the desktop Windows is still rearranging things: the screen is not
+                    # listed yet, still held by Windows, or changed again while it was being taken (Windows' own status for that is
+                    # "retry"). Seen in the test VM and on a laptop with a TV. Ask again at once; each kind goes into the log once.
+                    if ("$_" -match 'No connected specialized display|TargetAccessDenied|TargetStale|SystemStateChanged' -and $since.Elapsed.TotalSeconds -lt 20) {
+                        if (-not $early["$_"]) { $early["$_"] = 1; Log "auto: not ready yet, asking again: $_" }
+                        Start-Sleep -Milliseconds 200; continue
+                    }
+                    $fails++; Log "auto: $_"
+                    $null = [Pix]::SleepWhileLocked(1000 * [math]::Min(60, 2 * $fails))   # try again after 2 s, 4 s, ... at most a minute: no busy loop, no flood in the log
+                }
             }
+            Log 'auto: unlocked'
+            [Pix]::LockEnded()
+        } catch {
+            # Nothing outside restarts this program: it is started through a console host that hides its exit code from
+            # Windows (see Install-Auto.ps1). So it has to survive its own errors, a log file that cannot be written for a
+            # moment included, and start over.
+            try { Log "auto: starting over after an error: $_" } catch { }
+            Start-Sleep 10
         }
-        [Pix]::LockEnded()
     }
     return
 }

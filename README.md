@@ -4,7 +4,7 @@ Press **Win+L** and one monitor keeps showing its windows, live, while Windows i
 
 The lock is the genuine Windows lock. No Windows file is patched, Win+L is not intercepted, there is no imitation lock screen, and signing in works exactly as before. The kept monitor shows pictures only: it has no cursor, no keyboard focus and takes no input.
 
-**Status: pre-release.** The whole flow has been tested in a virtual machine with real Win+L presses and real password unlocks, on two and three screens. One step has not been run on real hardware yet: putting the picture onto a real monitor through a real graphics card. The VM's virtual graphics driver cannot do that step, so there the pictures were written to files. Details under [Tested and not tested](#tested-and-not-tested).
+**Status: pre-release.** The whole flow has been tested in a virtual machine with real Win+L presses and real password unlocks, on two and three screens. One step is not confirmed on real hardware yet: putting the picture onto a real monitor through a real graphics card. The VM's virtual graphics driver cannot do that step, so there the pictures were written to files. The first real attempt (a laptop with a TV on HDMI, version 0.1.0) stopped just before that step; 0.1.1 fixes what stopped it. Details under [Tested and not tested](#tested-and-not-tested).
 
 ## Requirements
 
@@ -29,6 +29,8 @@ powershell -ExecutionPolicy Bypass -File .\Install-Auto.ps1
 ```
 
 Then sign out and back in once, and restart Chrome and Edge once. After that, just press Win+L.
+
+To update, download the newer release and run the same command again; no sign-out is needed for that.
 
 To undo everything, including the two settings it changed:
 
@@ -66,7 +68,8 @@ After setup, this shows which screen it would be, without changing anything:
 - While locked, the PC is kept awake and the displays are kept on. Windows has one display-power switch for all monitors, so the other monitors stay lit, showing the lock screen.
 - Apps must keep drawing while the PC is locked. Classic apps do. Chrome and Edge do with the policy above. Apps built on Electron may freeze; there is no switch for them from outside.
 - The picture is refreshed up to four times a second while it changes, and once a second while it is still.
-- Logs: `%LOCALAPPDATA%\LockMonitor\log.txt` and `%ProgramFiles%\LockMonitor\switch.log`.
+- If none of the screen's windows can be drawn, the screen says why instead of staying black.
+- Logs: `%LOCALAPPDATA%\LockMonitor\log.txt` and `%ProgramFiles%\LockMonitor\switch.log`. For every lock they say what was noted, which screen was taken, how many pictures were shown, and anything that went wrong.
 
 ## Tested and not tested
 
@@ -78,11 +81,12 @@ Tested in a VMware guest (Windows 11 Enterprise LTSC 2024), with real key presse
 - three lock and unlock cycles as fast as the keys can be typed
 - the kept monitor unplugged during a lock, and a restart while locked: the monitor returns to the desktop by itself
 - the kept monitor missing at Win+L: nothing stays on
-- uninstall restores every setting
+- update and uninstall while it is running; uninstall restores every setting
+- on a PC where Windows Terminal is the console host: nothing of it shows a window
 
 Not tested:
 
-- the final step on real hardware (see Status)
+- the picture on real hardware (see Status)
 - a PC with two graphics adapters, monitors with different scaling, sleep and resume while locked, Electron apps
 - whether the number Windows Settings shows for a monitor equals its `\\.\DISPLAYn` number on your PC (the `-list` command above shows the choice)
 

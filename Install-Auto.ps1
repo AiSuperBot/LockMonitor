@@ -55,8 +55,16 @@ $settings = @(
 )
 function Mine($name) { (Get-ItemProperty $own -Name $name -ErrorAction SilentlyContinue).$name }
 function Current($s) { (Get-ItemProperty $s.Key -Name $s.Name -ErrorAction SilentlyContinue).($s.Name) }
+# Ending the task is not enough: the task only owns the window-less console host the agent is started through, and the
+# agent outlives that (measured). So the agent itself is ended as well.
+function Stop-Agent {
+    Stop-ScheduledTask 'LockMonitor-Agent' -ErrorAction SilentlyContinue
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like "*$dst\Show-Dashboard.ps1*-Auto*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
 
 if ($Remove) {
+    Stop-Agent
     foreach ($t in $tasks) { Stop-ScheduledTask $t -ErrorAction SilentlyContinue; Unregister-ScheduledTask $t -Confirm:$false -ErrorAction SilentlyContinue }
     if (Test-Path $helper) { Start-Process $helper -ArgumentList '-give' -Wait }   # never leave a screen off the desktop
     Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
@@ -73,7 +81,7 @@ if ($Remove) {
 if (-not (Test-Path $own)) { $null = New-Item $own }
 Remove-ItemProperty $own -Name Keep -ErrorAction SilentlyContinue   # which monitor to keep is settled afresh at the next lock
 $null = New-Item -ItemType Directory -Force $dst
-Stop-ScheduledTask 'LockMonitor-Agent' -ErrorAction SilentlyContinue   # a second run is an update: the running agent must not go on with the old files
+Stop-Agent   # a second run is an update: the running agent must not go on with the old files
 Copy-Item "$PSScriptRoot\Show-Dashboard.ps1" $dst -Force
 # The elevated part is a small program of its own, not a script: it starts in milliseconds at every lock and depends on
 # nothing a non-administrator can change. WindowsApplication = no console window flashing up at lock and unlock.
@@ -89,8 +97,10 @@ function Reg($name, $exe, $arg, $triggers, $level, $set) {
 }
 $short = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances Queue
 $long = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1)
-$ps = [Environment]::GetFolderPath('System') + '\WindowsPowerShell\v1.0\powershell.exe'
-Reg 'LockMonitor-Agent' $ps "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dst\Show-Dashboard.ps1`" -Auto" $logon 'Limited' $long
+# The agent is started through "conhost --headless": where Windows Terminal is the console host (the Windows 11 default),
+# -WindowStyle Hidden alone leaves a terminal window open for as long as the agent runs (measured).
+$sys = [Environment]::GetFolderPath('System')
+Reg 'LockMonitor-Agent' "$sys\conhost.exe" "--headless `"$sys\WindowsPowerShell\v1.0\powershell.exe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dst\Show-Dashboard.ps1`" -Auto" $logon 'Limited' $long
 Reg 'LockMonitor-Take' $helper '-take' (OnState 7) 'Highest' $short
 Reg 'LockMonitor-Give' $helper '-give' @((OnState 8), $logon) 'Highest' $short   # logon too: a restart while locked must not leave the screen off the desktop
 
