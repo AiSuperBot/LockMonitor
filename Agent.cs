@@ -125,6 +125,9 @@ public static class Pix {
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hgt, uint flags);
+    [StructLayout(LayoutKind.Sequential)] internal struct PLACEMENT { public int length, flags, showCmd, minX, minY, maxX, maxY; public RECT normal; }   // WINDOWPLACEMENT
+    [DllImport("user32.dll")] static extern bool GetWindowPlacement(IntPtr h, ref PLACEMENT p);
+    [DllImport("user32.dll")] static extern bool SetWindowPlacement(IntPtr h, ref PLACEMENT p);
     [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
@@ -160,9 +163,11 @@ public static class Pix {
     // Scale: the screen's display scaling in percent; OtherScale: that of another desktop screen when it differs, else 0.
     // Check: not a lock but the setup's test.
     public class Snap { public string Device; public int W, H, Scale, OtherScale; public List<Win> Wins = new List<Win>(); public bool Check; }
-    // One window: noted place and size; and, set anew for every picture, how it is right now and where it goes.
+    // One window: noted place and size (and Windows' own record of it, for PutBack); and, set anew for every picture, how
+    // it is right now and where it goes.
     public class Win {
         public IntPtr H; public int X, Y, W, Hgt, Asked; public string Title;
+        internal PLACEMENT place;
         internal RECT whole, seen; internal int bx, by, bw, bh; internal bool live;
         // drawn pixel for pixel: its visible part is exactly the size of its place in the picture
         internal bool Exact { get { return seen.r - seen.l == bw && seen.b - seen.t == bh; } }
@@ -176,20 +181,29 @@ public static class Pix {
     [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonProc cb, IntPtr data);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr hm, ref MONITORINFOEX mi);
 
+    // The screens of the desktop: handle and description of each.
+    static List<KeyValuePair<IntPtr, MONITORINFOEX>> Monitors() {
+        List<KeyValuePair<IntPtr, MONITORINFOEX>> all = new List<KeyValuePair<IntPtr, MONITORINFOEX>>();
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (hm, dc, rc, d) => {
+            MONITORINFOEX mi = new MONITORINFOEX(); mi.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+            if (GetMonitorInfo(hm, ref mi)) all.Add(new KeyValuePair<IntPtr, MONITORINFOEX>(hm, mi));
+            return true;
+        }, IntPtr.Zero);
+        return all;
+    }
+
     // The highest-numbered screen of the desktop (\\.\DISPLAYn) and the app windows on it.
     // null when the desktop has a single screen: there is nothing to keep then.
     public static Snap Snapshot() {
-        IntPtr best = IntPtr.Zero; int bestN = -1, count = 0; MONITORINFOEX bm = new MONITORINFOEX();
+        List<KeyValuePair<IntPtr, MONITORINFOEX>> all = Monitors();
+        if (all.Count < 2) return null;
+        IntPtr best = IntPtr.Zero; int bestN = -1; MONITORINFOEX bm = new MONITORINFOEX();
         Dictionary<IntPtr, int> scale = new Dictionary<IntPtr, int>();
-        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (hm, dc, rc, d) => {
-            MONITORINFOEX mi = new MONITORINFOEX(); mi.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
-            if (!GetMonitorInfo(hm, ref mi)) return true;
-            count++;
-            uint dx, dy; scale[hm] = GetDpiForMonitor(hm, 0, out dx, out dy) == 0 ? (int)Math.Round(dx * 100.0 / 96) : 0;   // 0 = effective DPI; 96 is 100%
-            int n = Common.Number(mi.device); if (n > bestN) { bestN = n; best = hm; bm = mi; }
-            return true;
-        }, IntPtr.Zero);
-        if (best == IntPtr.Zero || count < 2) return null;
+        foreach (KeyValuePair<IntPtr, MONITORINFOEX> m in all) {
+            uint dx, dy; scale[m.Key] = GetDpiForMonitor(m.Key, 0, out dx, out dy) == 0 ? (int)Math.Round(dx * 100.0 / 96) : 0;   // 0 = effective DPI; 96 is 100%
+            int n = Common.Number(m.Value.device); if (n > bestN) { bestN = n; best = m.Key; bm = m.Value; }
+        }
+        if (best == IntPtr.Zero) return null;
         Snap s = new Snap(); s.Device = bm.device; s.W = bm.mon.r - bm.mon.l; s.H = bm.mon.b - bm.mon.t; s.Scale = scale[best];
         foreach (int other in scale.Values) if (other != s.Scale && other != 0 && s.Scale != 0) s.OtherScale = other;
         StringBuilder text = new StringBuilder(256);
@@ -202,7 +216,7 @@ public static class Pix {
             text.Length = 0; GetWindowText(h, text, 256); if (text.Length == 0) return true;
             RECT whole, seen; if (!Outline(h, out whole, out seen)) return true;
             Win w = new Win(); w.H = h; w.X = seen.l - bm.mon.l; w.Y = seen.t - bm.mon.t; w.W = seen.r - seen.l; w.Hgt = seen.b - seen.t; w.Title = text.ToString();
-            s.Wins.Add(w); return true;
+            Place(w); s.Wins.Add(w); return true;
         }, IntPtr.Zero);
         return s;
     }
@@ -211,10 +225,10 @@ public static class Pix {
     // there in its smaller, restored size; enlarged to fit, it looked like a lower resolution). So a window that has
     // another size than noted is asked to take its noted size again, in the corner of the screen it is on now (measured:
     // a browser will not reach past the screen's edge from where Windows put it); nobody sees the desktop while the PC is
-    // locked. This is the only thing this program ever does to a window. It asks without waiting (0x4000), so a window
+    // locked. This is the only thing this program does to a window during a lock. It asks without waiting (0x4000), so a window
     // that does not answer cannot hold the pictures up, and at most 3 times: one that will not take the size is fitted
-    // instead. When the screen returns, Windows itself puts each window back exactly as it was (measured: maximized
-    // again, and its un-maximized place and size untouched).
+    // instead. When the screen returns, Windows 11 itself puts each window back exactly as it was (measured: maximized
+    // again, and its un-maximized place and size untouched); on Windows 10, PutBack does.
     static void GiveBackSize(Win w) {
         w.Asked++;
         // A window that Windows kept maximized on the other screen has that screen's size and refuses another one
@@ -226,6 +240,40 @@ public static class Pix {
         // place and size include the invisible border the window has now; 4 = same stacking, 0x10 = no focus
         SetWindowPos(w.H, IntPtr.Zero, mi.mon.l - (w.seen.l - w.whole.l), mi.mon.t - (w.seen.t - w.whole.t),
             w.W + (w.whole.r - w.whole.l) - (w.seen.r - w.seen.l), w.Hgt + (w.whole.b - w.whole.t) - (w.seen.b - w.seen.t), 0x4000 | 0x4 | 0x10);
+    }
+
+    // After the screen was held (a lock, or the setup's test): Windows 11 puts the windows of a screen that returns to the
+    // desktop back where they were; Windows 10 leaves them on the screen it moved them to (both measured, 19045 and 26100).
+    // So once the helper has put the screen back, every noted window that is still elsewhere is put back as Windows itself
+    // recorded it when it was noted: its place, maximized again if it was. Windows 11 has done it by then, so nothing
+    // moves there. Gives up when the screen does not return within 10 s (unplugged, switched off: the helper's own retries
+    // take as long) or the PC is locked again.
+    public static void PutBack(Snap s) {
+        if (s.Device == null || s.Wins.Count == 0) return;
+        IntPtr mon = IntPtr.Zero;
+        for (int i = 0; i < 40 && mon == IntPtr.Zero; i++) {
+            if (Common.Locked()) return;
+            if (Common.Taken() == null) foreach (KeyValuePair<IntPtr, MONITORINFOEX> m in Monitors()) if (m.Value.device == s.Device) mon = m.Key;
+            if (mon == IntPtr.Zero) Thread.Sleep(250);
+        }
+        if (mon == IntPtr.Zero) return;
+        Thread.Sleep(1500);   // Windows 11 is busy putting them back meanwhile
+        if (Common.Locked()) return;
+        int put = 0;
+        foreach (Win w in s.Wins) if (IsWindow(w.H) && !IsIconic(w.H) && MonitorFromWindow(w.H, 0) != mon && Restore(w)) put++;
+        if (put > 0) Agent.Log("put " + put + " window(s) back on " + s.Device);
+    }
+    internal static void Place(Win w) { w.place.length = Marshal.SizeOf(typeof(PLACEMENT)); if (!GetWindowPlacement(w.H, ref w.place)) w.place.length = 0; }
+    // Into its noted place without the focus (4 = SW_SHOWNOACTIVATE), then maximized there if it was (3). In two steps:
+    // a window that Windows left maximized on the other screen takes no new place in one (measured on Windows 10), and
+    // maximizing it from its place did not take the focus (measured). The flag 4 = WPF_ASYNCWINDOWPLACEMENT: asked without
+    // waiting, so a window that does not answer cannot hold this program up.
+    internal static bool Restore(Win w) {
+        if (w.place.length == 0) return false;
+        PLACEMENT p = w.place; p.flags = 4; p.showCmd = 4;
+        if (!SetWindowPlacement(w.H, ref p)) return false;
+        p.showCmd = w.place.showCmd;
+        return p.showCmd != 3 || SetWindowPlacement(w.H, ref p);
     }
 
     static Frame scratch;
@@ -302,7 +350,10 @@ public static class Pix {
         while (!Common.Locked()) {
             string held = Common.Taken();
             if (held == null) { kept = 0; noted = latest; latest = Snapshot(); }
-            else if (mayCheck && Common.Note("Check") != null) { Snap c = new Snap(); c.Check = true; return c; }
+            else if (mayCheck && Common.Note("Check") != null) {   // with the windows noted before the test took the screen, for PutBack
+                Snap c = new Snap(), n = noted ?? latest; c.Check = true; if (n != null) { c.Device = n.Device; c.Wins = n.Wins; }
+                return c;
+            }
             else if (++kept >= 8 && Common.Unlocked() && AskToGiveBack(held)) kept = -7;   // asked: allow 10 s before asking again
             Thread.Sleep(700);
         }
@@ -665,7 +716,7 @@ public static class Agent {
         bool checkedOnce = false;
         for (;;) {
             Pix.Snap noted = Pix.WaitForLock(!checkedOnce);
-            if (noted.Check) { checkedOnce = true; Check(framesTo); continue; }
+            if (noted.Check) { checkedOnce = true; Check(framesTo); Pix.PutBack(noted); continue; }
             Stopwatch locked = Stopwatch.StartNew(), since = null;
             int fails = 0, shown = 0; bool freed = false; HashSet<string> early = new HashSet<string>();
             while (Common.Locked()) {
@@ -689,6 +740,7 @@ public static class Agent {
                 Log("lock over after " + locked.Elapsed.TotalSeconds.ToString("0") + " s, " + (shown > 0 ? shown + " picture(s)"
                     : freed ? "no picture: Windows never handed the screen over" : "no picture: the helper did not free the screen (its reasons are in switch.log next to it)"));
             Pix.LockEnded();
+            if (freed) Pix.PutBack(noted);
         }
     }
 
@@ -801,6 +853,16 @@ public static class Agent {
             drawn = Pix.CaptureWindows(note, shot);
             Color fit = shot.Gdi.GetPixel(200, 215), outside = shot.Gdi.GetPixel(200, 60);
             Line("a window of another size is fitted into its place", drawn == 1 && Near(fit, 200, 100, 50) && Near(outside, 0, 0, 0), "inside " + Rgb(fit) + ", outside " + Rgb(outside));
+            Pix.Place(wa); Rectangle was = Pix.Visible(a.Handle);
+            a.SetBounds(300, 250, 200, 150); Forms.Application.DoEvents();   // as if Windows had moved it to another screen
+            bool asked = Pix.Restore(wa); Rectangle back = Pix.Visible(a.Handle);
+            for (int i = 0; i < 20 && back != was; i++) { Forms.Application.DoEvents(); Thread.Sleep(50); back = Pix.Visible(a.Handle); }
+            Line("a window moved away is put back in its place", asked && back == was, "now " + back.X + "," + back.Y + " " + back.Width + "x" + back.Height + ", was " + was.X + "," + was.Y + " " + was.Width + "x" + was.Height);
+            ShowWindow(a.Handle, 3); Forms.Application.DoEvents(); Pix.Place(wa);   // noted maximized
+            ShowWindow(a.Handle, 4); Forms.Application.DoEvents();                   // un-maximized meanwhile, as during a lock
+            asked = Pix.Restore(wa);
+            for (int i = 0; i < 20 && a.WindowState != Forms.FormWindowState.Maximized; i++) { Forms.Application.DoEvents(); Thread.Sleep(50); }
+            Line("a maximized window is maximized again", asked && a.WindowState == Forms.FormWindowState.Maximized, a.WindowState.ToString());
             a.Close(); b.Close();
             Line("a closed window is left out", Pix.CaptureWindows(note, shot) == 0, "");
         }

@@ -1,8 +1,8 @@
 // Elevated helper. Install-Auto.ps1 puts it into "%ProgramFiles%\LockMonitor\Switch-LastScreen.exe" and has Windows
 // start it on its own lock and unlock events. It does one thing: at lock it takes the highest-numbered screen off the
-// Windows desktop (-take), at unlock it puts it back (-give). It uses the documented switch behind
-// Settings > System > Display > Advanced display > "Remove display from desktop". The lock itself is not touched and
-// nothing else runs elevated: the picture is produced by LockMonitor-Agent.exe (Agent.cs), unelevated.
+// Windows desktop (-take), at unlock it puts it back (-give). It uses the switch behind
+// Settings > System > Display > Advanced display > "Remove display from desktop" (see Set). The lock itself is not
+// touched and nothing else runs elevated: the picture is produced by LockMonitor-Agent.exe (Agent.cs), unelevated.
 // Its log (switch.log next to it) has only what is out of the ordinary; the routine is in the agent's log.
 //
 // It is a program of its own, not a script, on purpose: it runs elevated on every lock, so it should start in
@@ -20,24 +20,37 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("LockMonitor helper: takes the kept screen off the desktop at lock, returns it at unlock")]
 
 static class SwitchLastScreen {
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    struct SetReq { public int type, size; public uint lo; public int hi; public uint id, flags; public Guid specType, specSubType;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string app; }
-    [DllImport("user32.dll")] static extern int DisplayConfigSetDeviceInfo(ref SetReq r);
-    [DllImport("user32.dll", EntryPoint = "DisplayConfigGetDeviceInfo")] static extern int GetInfo([In, Out] byte[] request);
+    [DllImport("user32.dll")] static extern int DisplayConfigSetDeviceInfo(byte[] request);
     [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint paths, out uint modes);
     [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint paths, [Out] byte[] pathArray, ref uint modes, [Out] byte[] modeArray, IntPtr topology);
 
     static string logFile;
     static void Log(string m) { Common.Log(logFile, m); }
 
-    // 0 = done. Found by experiment in the test VM: Windows wants exactly this type value (wingdi.h:
-    // GUID_MONITOR_OVERRIDE_PSEUDO_SPECIALIZED), an empty sub type and a non-empty application name; needs elevation.
+    static readonly Guid Pseudo = new Guid("f196c02f-f86f-4f9a-aa15-e9cebdfe3b96");   // wingdi.h: GUID_MONITOR_OVERRIDE_PSEUDO_SPECIALIZED
+
+    // 0 = done; needs elevation. First the documented request (SET_MONITOR_SPECIALIZATION = 13, 312 bytes), which
+    // Windows 11 takes with exactly this type GUID, an empty sub type and a non-empty application name (found by
+    // experiment in the test VM). Windows 10 does not know it: error 87 for every monitor (measured on 19045). Then the
+    // request Windows' own Settings sends for that switch, on Windows 10 and 11 alike (its elevated helper,
+    // SystemSettingsAdminFlows.exe SpecializeDisplay; read from that program and from its command line in the test VMs):
+    // type -23, 48 bytes: the GUID, on/off, and a value Windows checks against the monitor: the monitor's ID from
+    // Common.Report followed by "{GUID}", hashed like RtlHashUnicodeString (case-insensitive X65599), the first half of
+    // the characters giving the low 32 bits, the rest the high 32 bits (it matched Settings' value; with any other value
+    // Windows answers 87, Settings' own helper included).
     static int Set(uint lo, int hi, uint id, bool on) {
-        SetReq r = new SetReq(); r.type = 13; r.size = Marshal.SizeOf(typeof(SetReq)); r.lo = lo; r.hi = hi; r.id = id;
-        r.flags = on ? 1u : 0u; r.specType = new Guid("f196c02f-f86f-4f9a-aa15-e9cebdfe3b96"); r.app = "LockMonitor";
-        return DisplayConfigSetDeviceInfo(ref r);
+        byte[] r = Common.Request(13, 312, lo, hi, id);
+        BitConverter.GetBytes(on ? 1 : 0).CopyTo(r, 20); Pseudo.ToByteArray().CopyTo(r, 24); Encoding.Unicode.GetBytes("LockMonitor").CopyTo(r, 56);
+        int rc = DisplayConfigSetDeviceInfo(r);
+        byte[] report;
+        if (rc != 87 || (report = Common.Report(lo, hi, id)) == null) return rc;
+        string s = Common.Text(report, 20, 256) + "{" + Pseudo.ToString().ToUpperInvariant() + "}";
+        r = Common.Request(-23, 48, lo, hi, id);
+        Pseudo.ToByteArray().CopyTo(r, 20); BitConverter.GetBytes(on ? 1 : 0).CopyTo(r, 36);
+        BitConverter.GetBytes((ulong)Hash(s.Substring(s.Length / 2)) << 32 | Hash(s.Substring(0, s.Length / 2))).CopyTo(r, 40);
+        return DisplayConfigSetDeviceInfo(r);
     }
+    static uint Hash(string s) { uint h = 0; foreach (char c in s) h = h * 65599 + char.ToUpperInvariant(c); return h; }
 
     // Windows' list of display paths: 1 = all possible ones (QDC_ALL_PATHS), 2 = those of the desktop (QDC_ONLY_ACTIVE_PATHS).
     // DISPLAYCONFIG_PATH_INFO is 72 bytes: source adapter LUID at 0, source id at 8, target adapter LUID at 20, target id at 28.
@@ -49,21 +62,10 @@ static class SwitchLastScreen {
         return paths;
     }
 
-    // A DisplayConfigGetDeviceInfo request: header (type, size, adapter LUID, id), the answer follows it.
-    static byte[] Ask(int type, int size, uint lo, int hi, uint id) {
-        byte[] req = new byte[size];
-        BitConverter.GetBytes(type).CopyTo(req, 0); BitConverter.GetBytes(size).CopyTo(req, 4);
-        BitConverter.GetBytes(lo).CopyTo(req, 8); BitConverter.GetBytes(hi).CopyTo(req, 12); BitConverter.GetBytes(id).CopyTo(req, 16);
-        return GetInfo(req) == 0 ? req : null;
-    }
-    static string Text(byte[] answer, int at, int bytes) {   // a zero-terminated WCHAR[] in an answer
-        string s = Encoding.Unicode.GetString(answer, at, bytes); int z = s.IndexOf('\0'); return z >= 0 ? s.Substring(0, z) : s;
-    }
-
     // The monitor's own device path (DISPLAYCONFIG_TARGET_DEVICE_NAME: type 2, 420 bytes, the path at offset 164); "" if
     // there is no monitor. Measured in the test VM: it is the same after a restart, and Windows also gives it for a
     // screen that is off the desktop.
-    static string MonitorPath(uint lo, int hi, uint id) { byte[] a = Ask(2, 420, lo, hi, id); return a == null ? "" : Text(a, 164, 256); }
+    static string MonitorPath(uint lo, int hi, uint id) { byte[] a = Common.Ask(2, 420, lo, hi, id); return a == null ? "" : Common.Text(a, 164, 256); }
 
     // Where the screen named by a "Taken" note is now. Windows numbers the graphics adapters anew at every start, so the
     // adapter in a note that outlived a restart (the PC was restarted while locked) means nothing any more: the screen is
@@ -88,9 +90,9 @@ static class SwitchLastScreen {
         int best = -1; HashSet<string> screens = new HashSet<string>();
         for (int i = 0; i < np; i++) {
             int o = 72 * i;
-            byte[] a = Ask(1, 84, BitConverter.ToUInt32(paths, o), BitConverter.ToInt32(paths, o + 4), BitConverter.ToUInt32(paths, o + 8));   // DISPLAYCONFIG_SOURCE_DEVICE_NAME: WCHAR[32] at 20
+            byte[] a = Common.Ask(1, 84, BitConverter.ToUInt32(paths, o), BitConverter.ToInt32(paths, o + 4), BitConverter.ToUInt32(paths, o + 8));   // DISPLAYCONFIG_SOURCE_DEVICE_NAME: WCHAR[32] at 20
             if (a == null) continue;
-            string name = Text(a, 20, 64); screens.Add(name);
+            string name = Common.Text(a, 20, 64); screens.Add(name);
             int n = Common.Number(name);
             if (n > best) { best = n; device = name; lo = BitConverter.ToUInt32(paths, o + 20); hi = BitConverter.ToInt32(paths, o + 24); id = BitConverter.ToUInt32(paths, o + 28); }
         }

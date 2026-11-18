@@ -8,7 +8,7 @@ The lock is the genuine Windows lock. No Windows file is patched, Win+L is not i
 
 ## Requirements
 
-- Windows 10 version 2004 or later, or Windows 11, in the **Enterprise, Pro for Workstations or IoT Enterprise** edition. Only these hand a screen to a program. Measured on one laptop: refused on Pro, fine after changing to Enterprise.
+- Windows 10 version 2004 or later, or Windows 11, in the **Enterprise, Pro for Workstations or IoT Enterprise** edition. Only these hand a screen to a program. Measured on one laptop: refused on Pro, fine after changing to Enterprise. Windows 10 needs version 0.2.6 or later.
 - At least two monitors on the PC's own graphics outputs (not a USB display adapter), and a current display driver.
 - An administrator account for the one-time setup. The usual kind with UAC prompts is fine.
 
@@ -40,9 +40,9 @@ The highest-numbered screen (`\\.\DISPLAYn`), and from then on only that very mo
 
 ## What happens at Win+L
 
-1. Windows locks. Its own "workstation locked" event starts `Switch-LastScreen.exe -take` (elevated), which takes the monitor off the Windows desktop with the switch behind Settings > System > Display > Advanced display > "Remove display from desktop".
+1. Windows locks. Its own "workstation locked" event starts `Switch-LastScreen.exe -take` (elevated), which takes the monitor off the Windows desktop with the switch behind Settings > System > Display > Advanced display > "Remove display from desktop". Windows 10 does not know the documented form of that request, so there it sends the one Windows' own Settings sends.
 2. `LockMonitor-Agent.exe` (not elevated, waiting since sign-in) redraws on that monitor, live, the windows that were on it.
-3. At unlock, Windows' "unlocked" event starts `Switch-LastScreen.exe -give`: the monitor is a desktop screen again and Windows puts the windows back.
+3. At unlock, Windows' "unlocked" event starts `Switch-LastScreen.exe -give`: the monitor is a desktop screen again. Windows 11 puts the windows back on it; Windows 10 does not, so there the agent does.
 
 ## What the setup changes
 
@@ -56,7 +56,7 @@ The highest-numbered screen (`\\.\DISPLAYn`), and from then on only that very mo
 ## Good to know
 
 - **How faithful the picture is.** While the monitor is off the desktop, Windows keeps its windows on another screen, and that is where their picture comes from.
-  - Windows shrinks or un-maximizes them there, so the agent gives each window back the size it had. A maximized window is shown full size. This is the only thing ever done to a window, and Windows puts every window back as it was at unlock.
+  - Windows shrinks or un-maximizes them there, so the agent gives each window back the size it had. A maximized window is shown full size. At unlock every window goes back to where it was, maximized again if it was, without taking the focus. Nothing else is ever done to a window.
   - If the other screens together are smaller than the kept one, a window cannot get its full size and its picture is enlarged to fit.
   - If the other screens use a different scaling (Settings > System > Display > Scale), apps draw their windows for that scaling and everything looks larger or smaller. The same scaling on all screens gives an identical picture. The log says so when this applies.
 - The kept monitor goes blank for a moment at Win+L, and a TV has to find its signal again.
@@ -64,7 +64,7 @@ The highest-numbered screen (`\\.\DISPLAYn`), and from then on only that very mo
 - Apps must keep drawing while the PC is locked. Classic apps do. Chrome and Edge do with the policy above. Apps built on Electron may freeze; there is no switch for them from outside.
 - The picture is refreshed up to four times a second while it changes, and once a second while it is still. Only the rows that changed go to the graphics card, and windows completely hidden behind another one are not captured.
 - If none of the monitor's windows can be drawn, the monitor says why instead of staying black.
-- Logs: `%LOCALAPPDATA%\LockMonitor\log.txt` has two lines per lock (what is shown and from when, how long the lock lasted and how many pictures) plus anything that went wrong. `%ProgramFiles%\LockMonitor\switch.log` has only what was out of the ordinary. Nothing about how you signed in is recorded.
+- Logs: `%LOCALAPPDATA%\LockMonitor\log.txt` has two lines per lock (what is shown and from when, how long the lock lasted and how many pictures), on Windows 10 a third (how many windows were put back), plus anything that went wrong. `%ProgramFiles%\LockMonitor\switch.log` has only what was out of the ordinary. Nothing about how you signed in is recorded.
 - `"%ProgramFiles%\LockMonitor\LockMonitor-Agent.exe" -selftest | more` checks the PC's graphics and window capture without changing anything.
 
 ## Tested and not tested
@@ -82,11 +82,13 @@ Tested in a VMware guest (Windows 11 Enterprise LTSC 2024), with real key presse
 - the setup's live test, passing and failing, from the ready-built zip marked as downloaded from the internet
 - Windows refusing the request (made to happen with a deliberately wrong request): the setup shows Windows' own answer and explains it
 
+Tested in a VMware guest with Windows 10 Enterprise 22H2 (build 19045), from version 0.2.6: the setup and its live test, lock and unlock with a normal and a maximized window on the kept screen (both back in place afterwards, the focus left where it was), the kept monitor unplugged during a lock, and a restart while locked.
+
 Tested on real hardware (a laptop with a TV, by the first user): the edition requirement, and the picture with version 0.1.2.
 
 Not tested:
 
-- the compiled agent (version 0.2.0 and later) putting the picture on a real monitor (the setup's live test does exactly that on your PC)
+- the compiled agent (version 0.2.0 and later) putting the picture on a real monitor (the setup's live test does exactly that on your PC), and Windows 10 on real hardware
 - a PC with two graphics adapters, sleep and resume while locked, Electron apps
 - whether the number Windows Settings shows for a monitor equals its `\\.\DISPLAYn` number on your PC (the test picture shows which monitor it is)
 

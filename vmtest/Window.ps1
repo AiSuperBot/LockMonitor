@@ -21,6 +21,7 @@ public static class Wnd {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
     public static IntPtr Find(string part) {   // the first visible window whose title contains part
         SetThreadDpiAwarenessContext(new IntPtr(-4));
@@ -33,7 +34,7 @@ public static class Wnd {
         string screens = "screens=" + GetSystemMetrics(80);   // SM_CMONITORS
         if (h == IntPtr.Zero) return screens + " window not found";
         RECT r; GetWindowRect(h, out r);
-        return screens + " at " + r.l + "," + r.t + " size " + (r.r - r.l) + "x" + (r.b - r.t) + (IsZoomed(h) ? " maximized" : IsIconic(h) ? " minimized" : " normal");
+        return screens + " at " + r.l + "," + r.t + " size " + (r.r - r.l) + "x" + (r.b - r.t) + (IsZoomed(h) ? " maximized" : IsIconic(h) ? " minimized" : " normal") + (GetForegroundWindow() == h ? ", has the focus" : "");
     }
 }
 '@

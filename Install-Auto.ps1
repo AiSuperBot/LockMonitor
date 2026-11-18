@@ -164,12 +164,10 @@ elseif (-not $taken -and $why -match 'nothing to keep') {
     if ($why -match 'TargetAccessDenied') { 'Windows refuses to hand the screen to a program. Windows Home and Pro do that; it takes the Enterprise, Pro for Workstations or IoT Enterprise edition.' }
     if ($why -match 'this monitor no') { 'Windows says this monitor cannot be handed to a program. A likely reason is that Windows does not know the monitor: a converter or adapter (VGA ones especially) often hides the identity the monitor reports (its EDID). Settings > System > Display > Advanced display then shows no name for it, or "Generic Non-PnP Monitor". Connecting it so that Windows sees its name, for example by HDMI or DisplayPort straight from the PC, should help.' }
     if ($why -match 'this Windows no') { 'Windows says this PC cannot hand any monitor to a program. It takes Windows 10 version 2004 or later in the Enterprise, Pro for Workstations or IoT Enterprise edition, and a current graphics driver.' }
-    if ($why -match 'refused.*this monitor yes, this Windows yes') { 'Windows says this monitor and this PC allow it, and still refused the request. This Windows version may expect the request differently: it was worked out on Windows 11. Please report this line on the project''s GitHub page.' }
+    if ($why -match 'refused.*this monitor yes, this Windows yes') { 'Windows says this monitor and this PC allow it, and still refused the request, in its documented form and in the form Windows'' own Settings uses. Please report this line on the project''s GitHub page.' }
+    if ($why -match 'refused.*Windows 10 report') { 'Windows 10 refused the request its own Settings sends for "Remove display from desktop". If Settings > System > Display > Advanced display settings does not offer that switch for this monitor either, Windows 10 will not hand it to a program; otherwise please report this line on the project''s GitHub page.' }
     'Nothing is left installed.'
     return
-}
-if ((Get-ItemProperty $desk -Name RestorePreviousStateRecalcBehavior -ErrorAction SilentlyContinue).RestorePreviousStateRecalcBehavior -eq 1) {
-    'Note: "Remember window locations based on monitor connection" is off in Settings > System > Display > Multiple displays. With it off, your windows will not move back to the screen after unlocking.'
 }
 "Set up LockMonitor $version for $User ($(if ($ready) { 'the ready-built programs' } else { 'built here from the sources' })). Logs: %LOCALAPPDATA%\LockMonitor\log.txt and $dst\switch.log. Undo: .\Install-Auto.ps1 -Remove"
 $todo = @()

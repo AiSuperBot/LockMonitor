@@ -1,11 +1,11 @@
 <#
 Dot-source this on the HOST to drive the throwaway test VM (VMware Workstation, D:\Virtual Machines\LockTest).
 The VM has no network adapter. It exists so lock behaviour can be tested with real Win+L key presses and screenshots,
-without locking the real PC.     . .\vmtest\Vm.ps1
+without locking the real PC.     . .\vmtest\Vm.ps1       (another test VM: . .\vmtest\Vm.ps1 -VmDir <its folder>)
 #>
+param([string]$VmDir = 'D:\Virtual Machines\LockTest')   # the folder holds <folder name>.vmx and guest-credentials.txt
 $VmWs  = 'C:\Program Files (x86)\VMware\VMware Workstation'
-$VmDir = 'D:\Virtual Machines\LockTest'
-$Vmx   = "$VmDir\LockTest.vmx"
+$Vmx   = "$VmDir\$(Split-Path $VmDir -Leaf).vmx"
 $VmPw  = (Get-Content "$VmDir\guest-credentials.txt")[1]
 $VmOut = "$VmDir\out"; $null = New-Item -ItemType Directory -Force $VmOut      # shared into the guest as \\vmware-host\Shared Folders\out
 
