@@ -4,7 +4,7 @@ Press **Win+L** and one monitor keeps showing its windows, live, while Windows i
 
 The lock is the genuine Windows lock. No Windows file is patched, Win+L is not intercepted, there is no imitation lock screen, and signing in works exactly as before. The kept monitor shows pictures only: it has no pointer, no keyboard focus and takes no input.
 
-**Status: pre-release.** It works on real hardware: version 0.1.2 was run on a laptop with a TV on HDMI (Intel Iris Xe, Windows 11 Enterprise). Version 0.2.0 replaced the background script by a small compiled program that makes the same display calls; it has been through all the tests below in a virtual machine, and its setup tests it live on your PC.
+**Status: pre-release.** It works on real hardware: version 0.1.2 was run on a laptop with a TV on HDMI (Intel Iris Xe, Windows 11 Enterprise). Since version 0.2.0 the background program is a small compiled one that makes the same display calls; it has been through all the tests below in a virtual machine, and the setup tests it live on your PC.
 
 ## Requirements
 
@@ -12,15 +12,17 @@ The lock is the genuine Windows lock. No Windows file is patched, Win+L is not i
 - At least two monitors on the PC's own graphics outputs (not a USB display adapter), and a current display driver.
 - An administrator account for the one-time setup. The usual kind with UAC prompts is fine.
 
-Nothing is downloaded or installed besides the two small programs the setup builds, with the C# compiler that is part of Windows.
+Nothing else is installed: the setup adds two small programs and three scheduled tasks.
 
 ## Setup
 
-From an elevated PowerShell, in the folder with these files:
+Download `LockMonitor-<version>-bin.zip` from the newest release (it has both programs ready-built) and extract it. From an elevated PowerShell, in the extracted folder:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Install-Auto.ps1
 ```
+
+The same command in the source code (the repository, or a release's "Source code (zip)") first builds the two programs, as described under [Build](#build).
 
 The setup ends with a live test: the screen that will be kept goes dark for a few seconds and shows a test picture. If the test fails, the setup says why and removes everything again.
 
@@ -44,7 +46,7 @@ The highest-numbered screen (`\\.\DISPLAYn`), and from then on only that very mo
 
 ## What the setup changes
 
-- Two programs in `%ProgramFiles%\LockMonitor`, built from `Agent.cs` and `Switch-LastScreen.cs`.
+- Two programs in `%ProgramFiles%\LockMonitor`: `LockMonitor-Agent.exe` and `Switch-LastScreen.exe`.
 - Three scheduled tasks for your account: `LockMonitor-Agent`, `LockMonitor-Take`, `LockMonitor-Give`.
 - The Windows setting "Minimize windows when a monitor is disconnected" is turned off for your account. With it on, Windows minimizes the windows of the monitor that leaves the desktop and there is nothing left to show.
 - The Chrome and Edge policy `WindowOcclusionEnabled` is set to 0. These browsers stop drawing when the PC is locked, and this policy is their own switch for that. They will then say "managed by your organization". `-LeaveBrowsers` skips this.
@@ -83,13 +85,40 @@ Tested on real hardware (a laptop with a TV, by the first user): the edition req
 
 Not tested:
 
-- version 0.2.0's compiled agent putting the picture on a real monitor (the setup's live test does exactly that on your PC)
+- the compiled agent (version 0.2.0 and later) putting the picture on a real monitor (the setup's live test does exactly that on your PC)
 - a PC with two graphics adapters, sleep and resume while locked, Electron apps
 - whether the number Windows Settings shows for a monitor equals its `\\.\DISPLAYn` number on your PC (the test picture shows which monitor it is)
+
+## Build
+
+Building needs nothing but Windows 10 or 11 (64-bit): the C# compiler of .NET Framework 4.8, which is part of Windows, and Windows' own description of its display interface in `System32\WinMetadata`. No Visual Studio, SDK or download.
+
+In the source code, from a normal (not elevated) PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Build.ps1
+```
+
+This writes `bin\LockMonitor-Agent.exe` and `bin\Switch-LastScreen.exe` and prints the version, size and SHA256 of each; `-Out <folder>` writes them elsewhere. Both are optimized release builds (`/optimize+`) for any CPU, which run as 64-bit programs, without a console window and with high-entropy ASLR (`/highentropyva+`).
+
+The same by hand, in a Command Prompt in the source folder:
+
+```bat
+set FW=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319
+set MD=%WINDIR%\System32\WinMetadata
+mkdir bin
+%FW%\csc.exe /nologo /target:winexe /optimize+ /highentropyva+ /out:bin\Switch-LastScreen.exe Switch-LastScreen.cs
+%FW%\csc.exe /nologo /target:winexe /optimize+ /highentropyva+ /out:bin\LockMonitor-Agent.exe /r:%MD%\Windows.Devices.winmd /r:%MD%\Windows.Graphics.winmd /r:%MD%\Windows.Foundation.winmd /r:%FW%\System.Runtime.dll /r:%FW%\System.Runtime.WindowsRuntime.dll /r:%FW%\System.Runtime.InteropServices.WindowsRuntime.dll Agent.cs
+```
+
+To check a build without changing anything: `bin\LockMonitor-Agent.exe -selftest | more`.
+
+To install your own build, run `Install-Auto.ps1` in the source folder, which builds and installs in one go, or put the two programs next to `Install-Auto.ps1`, which then installs them as they are. That is how the release's `-bin.zip` is made: `Build.ps1`, then `Install-Auto.ps1`, `README.md` and the two programs in one zip.
 
 ## Files
 
 - `Install-Auto.ps1`: setup, update, removal.
+- `Build.ps1`: builds the two programs.
 - `Agent.cs`: the agent, `LockMonitor-Agent.exe`.
 - `Switch-LastScreen.cs`: the elevated helper, `Switch-LastScreen.exe`.
 - `vmtest\`: the harness used for the tests above. Its paths are those of the original test machine.

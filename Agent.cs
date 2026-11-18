@@ -20,6 +20,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -29,6 +30,12 @@ using Windows.Devices.Display.Core;
 using Windows.Graphics;
 using Windows.Graphics.DirectX;
 using Windows.Graphics.DirectX.Direct3D11;
+
+// shown in the file's Properties > Details, and in the log at every start
+[assembly: AssemblyTitle("LockMonitor agent: keeps one screen's windows showing while Windows is locked")]
+[assembly: AssemblyProduct("LockMonitor")]
+[assembly: AssemblyVersion("0.2.1")]
+[assembly: AssemblyFileVersion("0.2.1")]
 
 // Windows is still busy with the screen (it only just left the desktop): worth asking again at once.
 public class NotReady : Exception { public NotReady(string message) : base(message) { } }
@@ -621,7 +628,7 @@ public static class Show {
 }
 
 public static class Agent {
-    const string Version = "0.2.0";
+    static readonly string Version = typeof(Agent).Assembly.GetName().Version.ToString(3);
     static string logFile;
 
     // A few lines per lock at most; the file keeps its newer half when it passes 256 KB.

@@ -12,10 +12,17 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using Microsoft.Win32;
+
+// shown in the file's Properties > Details
+[assembly: AssemblyTitle("LockMonitor helper: takes the kept screen off the desktop at lock, returns it at unlock")]
+[assembly: AssemblyProduct("LockMonitor")]
+[assembly: AssemblyVersion("0.2.1")]
+[assembly: AssemblyFileVersion("0.2.1")]
 
 static class SwitchLastScreen {
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]

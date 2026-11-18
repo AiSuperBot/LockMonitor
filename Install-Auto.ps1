@@ -12,9 +12,10 @@ What then happens at Win+L (the genuine Windows lock, not intercepted):
 Which screen: the highest-numbered one, and from then on only that very monitor. If it is switched off or unplugged
 when you lock, nothing stays on: the next screen in line never takes its place. After changing monitors, run this again.
 
-The setup builds the two programs from Agent.cs and Switch-LastScreen.cs with the C# compiler that is part of Windows,
-puts them into "%ProgramFiles%\LockMonitor" (only administrators can change files there) and registers three scheduled
-tasks for the signed-in user, who must be an administrator (the usual kind with UAC prompts is fine):
+The setup puts the two programs into "%ProgramFiles%\LockMonitor" (only administrators can change files there): the
+ready-built ones next to it (a release's -bin.zip), or, run from the source code, built from Agent.cs and
+Switch-LastScreen.cs by Build.ps1. It registers three scheduled tasks for the signed-in user, who must be an
+administrator (the usual kind with UAC prompts is fine):
   LockMonitor-Agent  at sign-in, unlock  LockMonitor-Agent.exe         normal rights (one instance; an unlock starts it only if it is not running)
   LockMonitor-Take   at lock             Switch-LastScreen.exe -take   elevated
   LockMonitor-Give   at unlock, sign-in  Switch-LastScreen.exe -give   elevated
@@ -89,17 +90,12 @@ $null = New-Item -ItemType Directory -Force $dst
 Stop-Agent   # a second run is an update: the running agent must not go on with the old files
 Remove-Item "$dst\Show-Dashboard.ps1" -ErrorAction SilentlyContinue   # the agent of versions up to 0.1.3
 
-# Both programs are built here, from the sources next to this script, with the C# compiler that is part of Windows.
-# The agent is checked against Windows' own description of its display interface (the .winmd files) while it is built.
-$fw = [Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory().TrimEnd('\')
-$md = [Environment]::GetFolderPath('System') + '\WinMetadata'
-function Build($source, $exe, $references) {
-    $said = & "$fw\csc.exe" /nologo /target:winexe /optimize+ "/out:$exe" $references "$PSScriptRoot\$source"   # winexe: no console window ever
-    if ($LASTEXITCODE) { throw "Could not build $source with $fw\csc.exe:`n$($said | Out-String)" }
-}
-Build 'Switch-LastScreen.cs' $helper @()
-Build 'Agent.cs' $agent (@('Windows.Devices', 'Windows.Graphics', 'Windows.Foundation' | ForEach-Object { "/r:$md\$_.winmd" }) +
-    @('System.Runtime', 'System.Runtime.WindowsRuntime', 'System.Runtime.InteropServices.WindowsRuntime' | ForEach-Object { "/r:$fw\$_.dll" }))
+# The two programs: the ready-built ones next to this script (a release's -bin.zip), or else built here from the
+# sources next to it (the source code), by Build.ps1.
+$ready = (Test-Path "$PSScriptRoot\LockMonitor-Agent.exe") -and (Test-Path "$PSScriptRoot\Switch-LastScreen.exe")
+if ($ready) { Copy-Item "$PSScriptRoot\LockMonitor-Agent.exe", "$PSScriptRoot\Switch-LastScreen.exe" $dst -Force }
+else { $null = & "$PSScriptRoot\Build.ps1" -Out $dst }
+$version = (Get-Item $agent).VersionInfo.FileVersion
 
 $cls = Get-CimClass -Namespace Root/Microsoft/Windows/TaskScheduler -ClassName MSFT_TaskSessionStateChangeTrigger
 function OnState($s) { New-CimInstance -CimClass $cls -ClientOnly -Property @{ StateChange = $s; UserId = $User } }   # 7 = lock, 8 = unlock
@@ -167,7 +163,7 @@ elseif (-not $taken -and $why -match 'nothing to keep') {
 if ((Get-ItemProperty $desk -Name RestorePreviousStateRecalcBehavior -ErrorAction SilentlyContinue).RestorePreviousStateRecalcBehavior -eq 1) {
     'Note: "Remember window locations based on monitor connection" is off in Settings > System > Display > Multiple displays. With it off, your windows will not move back to the screen after unlocking.'
 }
-"Set up for $User. Logs: %LOCALAPPDATA%\LockMonitor\log.txt and $dst\switch.log. Undo: .\Install-Auto.ps1 -Remove"
+"Set up LockMonitor $version for $User ($(if ($ready) { 'the ready-built programs' } else { 'built here from the sources' })). Logs: %LOCALAPPDATA%\LockMonitor\log.txt and $dst\switch.log. Undo: .\Install-Auto.ps1 -Remove"
 $todo = @()
 if ($changed -contains 'PrevMonitorRemoval') { $todo += 'sign out and back in once (Windows reads its "Minimize windows when a monitor is disconnected" setting, now off, only at sign-in)' }
 if ($changed -match 'Occlusion') { $todo += 'restart Chrome and Edge once (they now keep drawing while the PC is locked, and will say "managed by your organization")' }
