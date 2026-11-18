@@ -6,7 +6,7 @@ param([string]$Out = 'C:\locktest\note.png', [string]$Agent = "$env:ProgramFiles
 $ErrorActionPreference = 'Stop'
 $null = [Reflection.Assembly]::UnsafeLoadFrom($Agent)   # not LoadFile: an agent installed from a downloaded zip carries the "from the internet" mark, which LoadFile refuses
 [Pix]::DpiAware()
-$s = [Pix]::Snapshot()
+$s = [Pix]::Snapshot($null)
 if (-not $s) { 'Snapshot: null (single screen)'; return }
 "screen $($s.Device) $($s.W)x$($s.H), windows: $($s.Wins.Count)"
 $s.Wins | ForEach-Object { '  hwnd 0x{0:X} at {1},{2} size {3}x{4}  "{5}"' -f $_.H.ToInt64(), $_.X, $_.Y, $_.W, $_.Hgt, $_.Title }

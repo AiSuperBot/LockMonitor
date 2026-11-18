@@ -10,8 +10,8 @@ using Microsoft.Win32;
 
 // shown in each file's Properties > Details; the agent also logs it at every start
 [assembly: AssemblyProduct("LockMonitor")]
-[assembly: AssemblyVersion("0.2.7")]
-[assembly: AssemblyFileVersion("0.2.7")]
+[assembly: AssemblyVersion("0.2.8")]
+[assembly: AssemblyFileVersion("0.2.8")]
 
 public static class Common {
     [DllImport("wtsapi32.dll")] static extern bool WTSQuerySessionInformation(IntPtr server, int session, int infoClass, out IntPtr buf, out int bytes);
@@ -43,6 +43,46 @@ public static class Common {
         string s = Encoding.Unicode.GetString(answer, at, bytes); int z = s.IndexOf('\0'); return z >= 0 ? s.Substring(0, z) : s;
     }
 
+    [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint paths, out uint modes);
+    [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint paths, [Out] byte[] pathArray, ref uint modes, [Out] byte[] modeArray, IntPtr topology);
+    // Windows' list of display paths: 1 = all possible ones (QDC_ALL_PATHS), 2 = those of the desktop (QDC_ONLY_ACTIVE_PATHS).
+    // DISPLAYCONFIG_PATH_INFO is 72 bytes: source adapter LUID at 0, source id at 8, target adapter LUID at 20, target id at 28.
+    // Sized first and read then: when the screens change in between, Windows answers 122 (ERROR_INSUFFICIENT_BUFFER) and
+    // its documentation says to ask again.
+    public static byte[] Paths(uint which, out uint np) {
+        for (int tries = 0; tries < 3; tries++) {
+            uint nm;
+            if (GetDisplayConfigBufferSizes(which, out np, out nm) != 0) break;
+            byte[] paths = new byte[72 * np], modes = new byte[64 * nm];
+            int rc = QueryDisplayConfig(which, ref np, paths, ref nm, modes, IntPtr.Zero);
+            if (rc == 0) return paths;
+            if (rc != 122) break;
+        }
+        np = 0; return new byte[0];
+    }
+
+    // The monitor's own device path (DISPLAYCONFIG_TARGET_DEVICE_NAME: type 2, 420 bytes, the path at offset 164); "" if
+    // there is no monitor. Measured in the test VM: it is the same after a restart, and Windows also gives it for a
+    // screen that is off the desktop.
+    public static string MonitorPath(uint lo, int hi, uint id) { byte[] a = Ask(2, 420, lo, hi, id); return a == null ? "" : Text(a, 164, 256); }
+
+    // Where the screen named by a "Taken" note is now; returns the note's parts. Windows numbers the graphics adapters anew
+    // at every start, so the adapter in a note that outlived a restart (the PC was restarted while locked) means nothing
+    // any more: the screen is then found again by its monitor path, as the same target on whichever adapter answers with
+    // that path. Measured in the test VM: without this, such a screen stayed off the desktop for good. Both programs go
+    // through this: the agent too, or it would look for the screen under the old numbers.
+    public static string[] Address(string note, out uint lo, out int hi, out uint id) {
+        string[] h = Parse(note, out lo, out hi, out id);
+        if (h.Length < 5 || h[4].Length == 0 || OffDesktop(lo, hi, id) != null) return h;
+        uint np; byte[] paths = Paths(1, out np); HashSet<long> tried = new HashSet<long>();
+        for (int i = 0; i < np; i++) {   // every adapter shows up in the list of all paths, even when its screen itself is hidden from it
+            long luid = BitConverter.ToInt64(paths, 72 * i);
+            if (!tried.Add(luid)) continue;
+            if (MonitorPath((uint)luid, (int)(luid >> 32), id) == h[4]) { lo = (uint)luid; hi = (int)(luid >> 32); break; }
+        }
+        return h;
+    }
+
     // What Windows says about handing a monitor to a program (GET_MONITOR_SPECIALIZATION = 12, 24 bytes): bit 0 = it is
     // off the desktop now, bit 1 = possible for this monitor, bit 2 = possible on this Windows. null = no answer: the
     // monitor is not connected, the adapter numbers in the request are from before a restart, or this is Windows 10,
@@ -60,8 +100,8 @@ public static class Common {
     public static string Describe(uint lo, int hi, uint id) {
         uint? f = Specialization(lo, hi, id);
         if (f != null) return "off the desktop: " + Yes(f, 1) + "; can be handed to a program: this monitor " + Yes(f, 2) + ", this Windows " + Yes(f, 4);
-        bool? off = OffDesktop(lo, hi, id);
-        return off == null ? "unknown" : "off the desktop: " + (off == true ? "yes" : "no") + " (Windows 10 report)";
+        byte[] r = Report(lo, hi, id);   // Windows 10
+        return r == null ? "unknown" : "off the desktop: " + Yes(BitConverter.ToUInt32(r, 588), 0x100) + " (Windows 10 report)";
     }
     static string Yes(uint? f, uint bit) { return (f & bit) != 0 ? "yes" : "no"; }
 

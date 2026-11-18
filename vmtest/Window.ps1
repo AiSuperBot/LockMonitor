@@ -7,7 +7,8 @@ Test-VM helper (logged-on session): one window, found by part of its title.
                                            -Log. Start it before a lock to see what Windows and the app do with a window
                                            when its screen leaves the desktop and returns.
 #>
-param([Parameter(Mandatory)][string]$Title, [switch]$Maximize, [switch]$Restore, [int]$Watch, [string]$Log = 'C:\locktest\window.log')
+#  .\Window.ps1 -Title x -Hide -After 10   hide it after 10 s, as an app may do (start it before a lock: commands cannot be started while locked)
+param([Parameter(Mandatory)][string]$Title, [switch]$Maximize, [switch]$Restore, [switch]$Hide, [int]$After, [int]$Watch, [string]$Log = 'C:\locktest\window.log')
 Add-Type @'
 using System; using System.Runtime.InteropServices; using System.Text;
 public static class Wnd {
@@ -39,8 +40,10 @@ public static class Wnd {
 }
 '@
 $h = [Wnd]::Find($Title)
+Start-Sleep $After
 if ($Maximize) { $null = [Wnd]::Show($h, 3) }   # SW_MAXIMIZE
 if ($Restore) { $null = [Wnd]::Show($h, 9) }    # SW_RESTORE
+if ($Hide) { $null = [Wnd]::Show($h, 0); Add-Content $Log ('{0:HH:mm:ss.ff} hid it' -f (Get-Date)) }   # SW_HIDE
 $prev = ''
 for ($end = (Get-Date).AddSeconds($Watch); (Get-Date) -lt $end; Start-Sleep -Milliseconds 250) {
     $row = [Wnd]::State($h)

@@ -21,8 +21,7 @@ using Microsoft.Win32;
 
 static class SwitchLastScreen {
     [DllImport("user32.dll")] static extern int DisplayConfigSetDeviceInfo(byte[] request);
-    [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint paths, out uint modes);
-    [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint paths, [Out] byte[] pathArray, ref uint modes, [Out] byte[] modeArray, IntPtr topology);
+
 
     static string logFile;
     static void Log(string m) { Common.Log(logFile, m); }
@@ -52,41 +51,10 @@ static class SwitchLastScreen {
     }
     static uint Hash(string s) { uint h = 0; foreach (char c in s) h = h * 65599 + char.ToUpperInvariant(c); return h; }
 
-    // Windows' list of display paths: 1 = all possible ones (QDC_ALL_PATHS), 2 = those of the desktop (QDC_ONLY_ACTIVE_PATHS).
-    // DISPLAYCONFIG_PATH_INFO is 72 bytes: source adapter LUID at 0, source id at 8, target adapter LUID at 20, target id at 28.
-    static byte[] Paths(uint which, out uint np) {
-        uint nm;
-        if (GetDisplayConfigBufferSizes(which, out np, out nm) != 0) { np = 0; return new byte[0]; }
-        byte[] paths = new byte[72 * np], modes = new byte[64 * nm];
-        if (QueryDisplayConfig(which, ref np, paths, ref nm, modes, IntPtr.Zero) != 0) np = 0;
-        return paths;
-    }
-
-    // The monitor's own device path (DISPLAYCONFIG_TARGET_DEVICE_NAME: type 2, 420 bytes, the path at offset 164); "" if
-    // there is no monitor. Measured in the test VM: it is the same after a restart, and Windows also gives it for a
-    // screen that is off the desktop.
-    static string MonitorPath(uint lo, int hi, uint id) { byte[] a = Common.Ask(2, 420, lo, hi, id); return a == null ? "" : Common.Text(a, 164, 256); }
-
-    // Where the screen named by a "Taken" note is now. Windows numbers the graphics adapters anew at every start, so the
-    // adapter in a note that outlived a restart (the PC was restarted while locked) means nothing any more: the screen is
-    // then found again by its monitor path, as the same target on whichever adapter answers with that path. Measured in
-    // the test VM: without this, such a screen stayed off the desktop for good.
-    static string[] Address(string note, out uint lo, out int hi, out uint id) {
-        string[] h = Common.Parse(note, out lo, out hi, out id);
-        if (h.Length < 5 || h[4].Length == 0 || Common.OffDesktop(lo, hi, id) != null) return h;
-        uint np; byte[] paths = Paths(1, out np); HashSet<long> tried = new HashSet<long>();
-        for (int i = 0; i < np; i++) {   // every adapter shows up in the list of all paths, even when its screen itself is hidden from it
-            long luid = BitConverter.ToInt64(paths, 72 * i);
-            if (!tried.Add(luid)) continue;
-            if (MonitorPath((uint)luid, (int)(luid >> 32), id) == h[4]) { lo = (uint)luid; hi = (int)(luid >> 32); break; }
-        }
-        return h;
-    }
-
     // The highest-numbered screen of the desktop (\\.\DISPLAYn) and the monitor behind it. Returns the number of screens.
     static int LastScreen(out uint lo, out int hi, out uint id, out string device) {
         lo = 0; hi = 0; id = 0; device = null;
-        uint np; byte[] paths = Paths(2, out np);
+        uint np; byte[] paths = Common.Paths(2, out np);
         int best = -1; HashSet<string> screens = new HashSet<string>();
         for (int i = 0; i < np; i++) {
             int o = 72 * i;
@@ -103,7 +71,7 @@ static class SwitchLastScreen {
         string held = k.GetValue("Taken") as string, keep = k.GetValue("Keep") as string;
         uint lo, id; int hi; string device;
         if (held != null) {
-            string[] h = Address(held, out lo, out hi, out id);
+            string[] h = Common.Address(held, out lo, out hi, out id);
             bool? off = Common.OffDesktop(lo, hi, id);
             // the note is stale if the screen was put back by hand meanwhile, or is gone and no longer the one to keep (monitors changed, setup run again)
             if (off == false || (off == null && h.Length > 4 && h[4] != keep)) k.DeleteValue("Taken", false);
@@ -112,7 +80,9 @@ static class SwitchLastScreen {
         if (!force && !Common.Locked()) { Log("take: the PC is not locked (any more), nothing done"); return; }
         int screens = LastScreen(out lo, out hi, out id, out device);
         if (screens < 2 || device == null) { Log("take: " + screens + " screen(s) on the desktop, nothing to keep"); return; }
-        string path = MonitorPath(lo, hi, id);
+        string path = Common.MonitorPath(lo, hi, id);
+        // without the monitor's own path it could neither be told apart from others nor found again after a restart
+        if (path.Length == 0) { Log("take: Windows names no monitor behind " + device + ", so nothing stays on at this lock"); return; }
         // Only ever one and the same monitor: the one taken first after the setup. When that one is switched off or
         // unplugged, the next screen in line must not stay visible in its place while the PC is locked.
         if (keep != null && keep != path) {
@@ -131,7 +101,7 @@ static class SwitchLastScreen {
     static void Give(RegistryKey k) {
         string held = k.GetValue("Taken") as string;
         if (held == null) return;
-        uint lo, id; int hi; string[] h = Address(held, out lo, out hi, out id);
+        uint lo, id; int hi; string[] h = Common.Address(held, out lo, out hi, out id);
         int rc = 0;
         for (int i = 0; i < 40; i++) {   // 10 s: the picture program lets go of the screen within a fraction of a second after the unlock
             rc = Set(lo, hi, id, false);
@@ -154,7 +124,7 @@ static class SwitchLastScreen {
                 uint lo, id; int hi; string device; int screens = LastScreen(out lo, out hi, out id, out device);
                 string keep = Common.Note("Keep") as string;
                 Console.WriteLine(screens + " screen(s) on the desktop; highest-numbered: " + (device ?? "none") + (device == null ? "" : "  (adapter " + hi + ":" + lo + ", target " + id + ", " + Common.Describe(lo, hi, id) + ")") + "; PC locked: " + Common.Locked()
-                    + "; screen kept at lock: " + (keep == null ? "the one taken at the next lock" : device != null && keep == MonitorPath(lo, hi, id) ? "this one" : "not this one but " + keep));
+                    + "; screen kept at lock: " + (keep == null ? "the one taken at the next lock" : device != null && keep == Common.MonitorPath(lo, hi, id) ? "this one" : "not this one but " + keep));
                 return 0;
             }
             if (!take && !give) return 2;

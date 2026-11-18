@@ -15,7 +15,9 @@ param([string]$Out)
 $ErrorActionPreference = 'Stop'
 if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { throw 'Run this from the normal PowerShell, not the "(x86)" one.' }
 if (-not $Out) { $Out = "$PSScriptRoot\bin" }   # set here, not as the parameter's default: under -File that default cannot see the script's folder
-$fw = [Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory().TrimEnd('\')   # ...\Microsoft.NET\Framework64\v4.0.30319: csc.exe and the facade assemblies
+# csc.exe and the facade assemblies of .NET Framework 4.8; named outright, so that this also works from PowerShell 7,
+# which runs on another .NET
+$fw = "$env:WINDIR\Microsoft.NET\Framework$(if ([Environment]::Is64BitOperatingSystem) { '64' })\v4.0.30319"
 $md = [Environment]::GetFolderPath('System') + '\WinMetadata'
 $null = New-Item -ItemType Directory -Force $Out
 $winrt = @('Windows.Devices', 'Windows.Graphics', 'Windows.Foundation' | ForEach-Object { "/r:$md\$_.winmd" }) +

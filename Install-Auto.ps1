@@ -7,7 +7,7 @@ What then happens at Win+L (the genuine Windows lock, not intercepted):
   2. LockMonitor-Agent.exe (not elevated, running since sign-in) redraws on that screen, live, the windows that were on
      it. The other screens show the normal lock screen; keyboard and mouse work there as always.
   3. At unlock it lets go, and Windows' "unlocked" event starts Switch-LastScreen.exe -give: the screen is a normal
-     desktop screen again and Windows moves your windows back.
+     desktop screen again and your windows go back on it (Windows 11 moves them itself; on Windows 10 the agent does).
 
 Which screen: the highest-numbered one, and from then on only that very monitor. If it is switched off or unplugged
 when you lock, nothing stays on: the next screen in line never takes its place. After changing monitors, run this again.
@@ -55,8 +55,8 @@ $userDir = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion
 # every setting this setup changes: where it lives, its name, the value needed, and the name its old value is remembered under
 $settings = @(
     @{ Key = $desk; Name = 'MonitorRemovalRecalcBehavior'; Want = 1; Memo = 'PrevMonitorRemoval' },
-    @{ Key = 'HKLM:\SOFTWARE\Policies\Google\Chrome'; Name = 'WindowOcclusionEnabled'; Want = 0; Memo = 'PrevChromeOcclusion'; Browser = $true },
-    @{ Key = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; Name = 'WindowOcclusionEnabled'; Want = 0; Memo = 'PrevEdgeOcclusion'; Browser = $true }
+    @{ Key = 'HKLM:\SOFTWARE\Policies\Google\Chrome'; Name = 'WindowOcclusionEnabled'; Want = 0; Memo = 'PrevChromeOcclusion'; Exe = 'chrome'; Browser = 'Chrome (type chrome://restart in its address bar)' },
+    @{ Key = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; Name = 'WindowOcclusionEnabled'; Want = 0; Memo = 'PrevEdgeOcclusion'; Exe = 'msedge'; Browser = 'Edge (edge://restart)' }
 )
 function Mine($name) { (Get-ItemProperty $own -Name $name -ErrorAction SilentlyContinue).$name }
 function Current($s) { (Get-ItemProperty $s.Key -Name $s.Name -ErrorAction SilentlyContinue).($s.Name) }
@@ -74,8 +74,10 @@ function Uninstall {
     Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
     foreach ($s in $settings) {   # each setting goes back to what it was before the setup; settings the setup never changed are left alone
         $was = Mine $s.Memo
-        if ($was -eq 'unset') { Remove-ItemProperty $s.Key -Name $s.Name -ErrorAction SilentlyContinue }
-        elseif ($null -ne $was) { Set-ItemProperty $s.Key -Name $s.Name -Value ([int]$was) -Type DWord }
+        try {   # one that cannot be put back (another user's, whose settings are not loaded now) must not stop the others
+            if ($was -eq 'unset') { Remove-ItemProperty $s.Key -Name $s.Name -ErrorAction SilentlyContinue }
+            elseif ($null -ne $was) { Set-ItemProperty $s.Key -Name $s.Name -Value ([int]$was) -Type DWord }
+        } catch { "Could not put $($s.Name) back to $was in $($s.Key): $($_.Exception.Message)" }
     }
     Remove-Item $own -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -111,13 +113,34 @@ function Reg($name, $exe, $arg, $triggers, $level, $set) {
     $who = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel $level   # Interactive: inside the user's own session
     Register-ScheduledTask -TaskName $name -Force -Action $act -Trigger $triggers -Principal $who -Settings $set | Out-Null
 }
-$short = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances Queue
-$long = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+# priority 5 = a normal one: a task's default (7) gives way to every busy app, and the take and the pictures should not wait
+$short = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances Queue -Priority 5
+$long = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -Priority 5
 # At every unlock too: Windows does not restart an agent that died (measured), so each unlock starts it if it is not
 # running; while it is running, the extra start is ignored.
 Reg 'LockMonitor-Agent' $agent $(if ($TestFrames) { "-frames `"$TestFrames`"" }) @($logon, (OnState 8)) 'Limited' $long
 Reg 'LockMonitor-Take' $helper '-take' (OnState 7) 'Highest' $short
 Reg 'LockMonitor-Give' $helper '-give' @((OnState 8), $logon) 'Highest' $short   # sign-in too: a restart while locked must not leave the screen off the desktop
+
+# The tasks run as $User, not as the administrator who runs this setup, and the helper needs administrator rights (it
+# writes where only administrators can); the live test below starts the helper itself and would pass for a user who is
+# no administrator. So a throwaway task with the same user and rights has Windows' reg.exe leave a note where only an
+# administrator can write. (Task Scheduler's own record of a run is no proof: measured, a task registered again keeps
+# its old run time, and started at once it did not get a new one.)
+Remove-ItemProperty $own -Name Probe -ErrorAction SilentlyContinue
+$probe = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\reg.exe" -Argument 'add HKLM\SOFTWARE\LockMonitor /v Probe /t REG_SZ /d 1 /f'
+Register-ScheduledTask -TaskName 'LockMonitor-Probe' -Force -Action $probe -Principal (New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest) -Settings $short | Out-Null
+Start-ScheduledTask 'LockMonitor-Probe'
+for ($i = 0; $i -lt 40 -and -not (Mine 'Probe'); $i++) { Start-Sleep -Milliseconds 250 }
+$rights = [bool](Mine 'Probe')
+Unregister-ScheduledTask 'LockMonitor-Probe' -Confirm:$false
+Remove-ItemProperty $own -Name Probe -ErrorAction SilentlyContinue
+if (-not $rights) {
+    Uninstall
+    "Setup FAILED: Windows did not run a task as $User with administrator rights. The tasks LockMonitor needs run as $User, so $User must be signed in and be an administrator (the usual kind with UAC prompts is fine)."
+    'Nothing is left installed.'
+    return
+}
 
 $os = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $changed = @()
@@ -131,15 +154,19 @@ foreach ($s in $settings) {
     Set-ItemProperty $s.Key -Name $s.Name -Value $s.Want -Type DWord
     $changed += $s.Memo
 }
+$start = (Get-Date).ToString('s')   # both logs start every line with this kind of time stamp
+# robust against the logs being trimmed meanwhile; the programs write UTF-8, which PowerShell 5.1 does not assume
+function Since($file) { if (Test-Path $file) { @(Get-Content $file -Encoding UTF8 | Where-Object { $_.Length -ge 19 -and $_.Substring(0, 19) -ge $start }) } }
 Start-ScheduledTask 'LockMonitor-Agent'
 
 # The live test: the helper takes the screen as it will at Win+L, the agent shows a text on it for a few seconds (it
 # does so because of the note "Check", which only administrators can leave), and the helper puts the screen back.
 "Windows: $((Get-CimInstance Win32_OperatingSystem).Caption), edition $($os.EditionID), build $($os.CurrentBuild)"
 'Testing: the highest-numbered screen goes dark for a few seconds and shows a test picture. Its windows move away and come back.'
-Start-Sleep 1   # the agent has to be up and waiting
-$start = (Get-Date).ToString('s')   # both logs start every line with this kind of time stamp
-function Since($file) { if (Test-Path $file) { @(Get-Content $file | Where-Object { $_.Length -ge 19 -and $_.Substring(0, 19) -ge $start }) } }   # robust against the logs being trimmed meanwhile
+# the agent has to be up and to have noted the screen's windows (so that they can be put back after the test): it
+# notes them every 0.7 s from its start, and a freshly copied program may take a while to start (a virus scan, say)
+for ($i = 0; $i -lt 40 -and -not (Since "$userDir\log.txt" | Where-Object { $_ -match ' started' }); $i++) { Start-Sleep -Milliseconds 250 }
+Start-Sleep -Milliseconds 1500
 Set-ItemProperty $own -Name Check -Value 1 -Type DWord
 $taken = $false; $verdict = $null
 try {
@@ -174,8 +201,7 @@ elseif (-not $taken -and $why -match 'nothing to keep') {
 "Set up LockMonitor $version for $User ($(if ($ready) { 'the ready-built programs' } else { 'built here from the sources' })). Logs: %LOCALAPPDATA%\LockMonitor\log.txt and $dst\switch.log. Undo: .\Install-Auto.ps1 -Remove"
 $todo = @()
 if ($changed -contains 'PrevMonitorRemoval') { $todo += 'sign out and back in once (Windows reads its "Minimize windows when a monitor is disconnected" setting, now off, only at sign-in)' }
-if ($changed -match 'Occlusion') {   # a browser that runs now takes the new setting only when it starts again (measured: until then it freezes at a lock)
-    $open = @(Get-Process chrome, msedge -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ProcessName -Unique | ForEach-Object { if ($_ -eq 'chrome') { 'Chrome (type chrome://restart in its address bar)' } else { 'Edge (edge://restart)' } })
-    if ($open) { $todo += "restart $($open -join ' and ') once: until then it stops drawing while the PC is locked. Afterwards it says ""managed by your organization""" }
-}
+# a browser that runs now takes its new setting only when it starts again (measured: until then it freezes at a lock)
+$open = @($settings | Where-Object { $_.Exe -and $changed -contains $_.Memo -and (Get-Process $_.Exe -ErrorAction SilentlyContinue) } | ForEach-Object { $_.Browser })
+if ($open) { $todo += "restart $($open -join ' and ') once: until then it stops drawing while the PC is locked. Afterwards it says ""managed by your organization""" }
 if ($todo) { 'Before the first use: ' + ($todo -join '; and ') + '. After that, just press Win+L.' } else { 'Press Win+L to use it.' }

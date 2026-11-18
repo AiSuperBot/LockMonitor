@@ -24,7 +24,7 @@ powershell -ExecutionPolicy Bypass -File .\Install-Auto.ps1
 
 The same command in the source code (the repository, or a release's "Source code (zip)") first builds the two programs, as described under [Build](#build).
 
-The setup ends with a live test: the screen that will be kept goes dark for a few seconds and shows a test picture. If the test fails, the setup says why and removes everything again.
+The setup checks that the scheduled tasks get administrator rights for your account, and ends with a live test: the screen that will be kept goes dark for a few seconds and shows a test picture. If either fails, the setup says why and removes everything again.
 
 Then do what the setup lists at its end, once: on Windows 11 sign out and back in, and restart Chrome and Edge if they are running (`chrome://restart` or `edge://restart` in the address bar brings the tabs back). After that, just press Win+L.
 
@@ -64,7 +64,7 @@ The highest-numbered screen (`\\.\DISPLAYn`), and from then on only that very mo
 - Apps must keep drawing while the PC is locked. Classic apps do. Chrome and Edge do with the policy above, from their next start: one that has run since before the setup freezes at a lock, its page dark (the log then says so). Apps built on Electron may freeze; there is no switch for them from outside.
 - The picture is refreshed up to four times a second while it changes, and once a second while it is still. Only the rows that changed go to the graphics card, and windows completely hidden behind another one are not captured.
 - If none of the monitor's windows can be drawn, the monitor says why instead of staying black.
-- Logs: `%LOCALAPPDATA%\LockMonitor\log.txt` has two lines per lock (what is shown and from when, how long the lock lasted and how many pictures), on Windows 10 a third (how many windows were put back), plus anything that went wrong. `%ProgramFiles%\LockMonitor\switch.log` has only what was out of the ordinary. Nothing about how you signed in is recorded.
+- Logs: `%LOCALAPPDATA%\LockMonitor\log.txt` has two lines per lock (what is shown and from when, how long the lock lasted and how many pictures), on Windows 10 a third (how many windows were put back), a hint when Chrome or Edge may need its one restart, plus anything that went wrong. `%ProgramFiles%\LockMonitor\switch.log` has only what was out of the ordinary. Nothing about how you signed in is recorded.
 - `"%ProgramFiles%\LockMonitor\LockMonitor-Agent.exe" -selftest | more` checks the PC's graphics and window capture without changing anything.
 
 ## Tested and not tested
@@ -82,13 +82,14 @@ Tested in a VMware guest (Windows 11 Enterprise LTSC 2024), with real key presse
 - the setup's live test, passing and failing, from the ready-built zip marked as downloaded from the internet
 - Windows refusing the request (made to happen with a deliberately wrong request): the setup shows Windows' own answer and explains it
 
-Tested in a VMware guest with Windows 10 Enterprise 22H2 (build 19045), from version 0.2.6: the setup and its live test, lock and unlock with a normal and a maximized window on the kept screen (both back in place afterwards, the focus left where it was), the kept monitor unplugged during a lock, and a restart while locked.
+Tested in a VMware guest with Windows 10 Enterprise 22H2 (build 19045), from version 0.2.6: the setup and its live test, lock and unlock with a normal and a maximized window on the kept screen (both back in place afterwards, the focus left where it was), the kept monitor unplugged during a lock, a restart while locked, also with the kept monitor unplugged until after the restart, a window hidden by its app during a lock, Chrome started before the setup, and the setup for an account the tasks cannot get administrator rights for.
 
 Tested on real hardware, by the first user: the edition requirement and the picture with version 0.1.2 (laptop with a TV, Windows 11); the picture with version 0.2.6 (desktop PC with Windows 10, Grafana in Chrome on a TV).
 
 Not tested:
 
 - a PC with two graphics adapters, sleep and resume while locked, Electron apps
+- a kept monitor that is turned to portrait: the picture is not turned with it
 - whether the number Windows Settings shows for a monitor equals its `\\.\DISPLAYn` number on your PC (the test picture shows which monitor it is)
 
 ## Build
