@@ -50,6 +50,7 @@ $own = 'HKLM:\SOFTWARE\LockMonitor'
 # that user's own settings and files, reachable whichever administrator account approved the elevation
 $sid = (New-Object Security.Principal.NTAccount($User)).Translate([Security.Principal.SecurityIdentifier]).Value
 $desk = "Registry::HKEY_USERS\$sid\Control Panel\Desktop"
+$userDir = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath + '\AppData\Local\LockMonitor'   # the agent's log
 # every setting this setup changes: where it lives, its name, the value needed, and the name its old value is remembered under
 $settings = @(
     @{ Key = $desk; Name = 'MonitorRemovalRecalcBehavior'; Want = 1; Memo = 'PrevMonitorRemoval' },
@@ -80,6 +81,7 @@ function Uninstall {
 
 if ($Remove) {
     Uninstall
+    Remove-Item $userDir -Recurse -Force -ErrorAction SilentlyContinue   # the agent's log; kept when a failed test undoes the setup, so that it can be read
     'Removed. Sign out and back in for the Windows setting, and restart Chrome and Edge, to be exactly as before.'
     return
 }
@@ -130,10 +132,9 @@ Start-ScheduledTask 'LockMonitor-Agent'
 $os = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 "Windows: $((Get-CimInstance Win32_OperatingSystem).Caption), edition $($os.EditionID), build $($os.CurrentBuild)"
 'Testing: the highest-numbered screen goes dark for a few seconds and shows a test picture. Its windows move away and come back.'
-$log = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath + '\AppData\Local\LockMonitor\log.txt'
-$seen = @(if (Test-Path $log) { Get-Content $log }).Count
-$told = @(if (Test-Path "$dst\switch.log") { Get-Content "$dst\switch.log" }).Count
 Start-Sleep 1   # the agent has to be up and waiting
+$start = (Get-Date).ToString('s')   # both logs start every line with this kind of time stamp
+function Since($file) { if (Test-Path $file) { @(Get-Content $file | Where-Object { $_.Length -ge 19 -and $_.Substring(0, 19) -ge $start }) } }   # robust against the logs being trimmed meanwhile
 Set-ItemProperty $own -Name Check -Value 1 -Type DWord
 $taken = $false; $verdict = $null
 try {
@@ -141,7 +142,7 @@ try {
     $taken = [bool](Mine 'Taken')
     for ($i = 0; $taken -and -not $verdict -and $i -lt 80; $i++) {   # the agent gives up after 12 s; allow 20
         Start-Sleep -Milliseconds 250
-        $verdict = @(if (Test-Path $log) { Get-Content $log | Select-Object -Skip $seen }) | Where-Object { $_ -match ' check: ' } | Select-Object -Last 1
+        $verdict = Since "$userDir\log.txt" | Where-Object { $_ -match ' check: ' } | Select-Object -Last 1
     }
     if ($verdict -match 'is on the screen') { Start-Sleep 4 }   # leave it there long enough to be seen
 } finally {
@@ -149,7 +150,8 @@ try {
     Remove-ItemProperty $own -Name Check -ErrorAction SilentlyContinue
 }
 $why = if ($verdict) { $verdict -replace '^.* check: ' } elseif ($taken) { 'the agent did not answer' }
-       else { (@(if (Test-Path "$dst\switch.log") { Get-Content "$dst\switch.log" | Select-Object -Skip $told }) | Select-Object -Last 1) -replace '^\S+ (take: )?' }
+       else { (Since "$dst\switch.log" | Select-Object -Last 1) -replace '^\S+ (take: )?' }
+if (-not $why) { $why = 'the helper did not take the screen, and its log does not say why' }
 if ($verdict -match 'is on the screen') { "Test passed: $why. That screen is the one kept at Win+L." }
 elseif (-not $taken -and $why -match 'nothing to keep') {
     "Not tested: $why. It stays set up; run this again when all screens are connected, to have it tested."

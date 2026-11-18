@@ -11,9 +11,9 @@ $Log = "$Dir\unplug-probe.log"
 for ($end = (Get-Date).AddSeconds($Seconds); (Get-Date) -lt $end; Start-Sleep 2) {
     $dm = [Windows.Devices.Display.Core.DisplayManager]::Create('None')
     # connected targets only: an unplugged screen simply drops out of the row
-    $targets = ($dm.GetCurrentTargets() | Where-Object IsConnected | ForEach-Object { 'target {0}: {1} {2}' -f $_.AdapterRelativeId, $_.UsageKind, ([Spec]::Get($_.Adapter.Id.LowPart, $_.Adapter.Id.HighPart, $_.AdapterRelativeId) -replace ', possible.*$') }) -join '; '
+    $targets = ($dm.GetCurrentTargets() | Where-Object IsConnected | ForEach-Object { 'target {0}: {1} {2}' -f $_.AdapterRelativeId, $_.UsageKind, ([Common]::Describe($_.Adapter.Id.LowPart, $_.Adapter.Id.HighPart, $_.AdapterRelativeId) -replace ';.*$') }) -join '; '
     $dm.Dispose()
     $desk = (& "$env:ProgramFiles\LockMonitor\Switch-LastScreen.exe" -list | Out-String).Trim() -replace ';.*$'
-    Add-Content $Log ('{0:HH:mm:ss} flag={1} note={2} | {3} | {4}' -f (Get-Date), [Pix]::Flags(), ([Pix]::Taken() -replace '\|\\\\\?.*$'), $desk, $targets)
+    Add-Content $Log ('{0:HH:mm:ss} flag={1} note={2} | {3} | {4}' -f (Get-Date), [Common]::SessionFlag(), ([Common]::Taken() -replace '\|\\\\\?.*$'), $desk, $targets)
 }
 Add-Content $Log ('{0:HH:mm:ss} end' -f (Get-Date))

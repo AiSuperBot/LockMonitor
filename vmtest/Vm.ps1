@@ -50,6 +50,10 @@ function Vm-Shot($Name) { $f = "$VmOut\$Name.png"; & "$VmWs\vmcli.exe" $Vmx MKS 
 # vmcli wants it as (usage << 16) | 7; found by experiment, its help does not say.
 function Vm-Key([int]$Usage, [int]$Modifier = 0) { & "$VmWs\vmcli.exe" $Vmx MKS sendKeyEvent (($Usage -shl 16) -bor 7) $Modifier 2>&1 | Out-String }
 function Vm-Line($Text) { Vm-Type $Text | Out-Null; Start-Sleep -Milliseconds 400; Vm-Key 0x28 | Out-Null }   # type a line and press Enter
+function Vm-LockUnlock([int]$Seconds = 12) {   # Win+L, stay locked, then unlock the real way: Enter, wait for the sign-in box, the password
+    Vm-Key 0x0F 8 | Out-Null; Start-Sleep $Seconds; Vm-Key 0x28 | Out-Null; Start-Sleep 3; Vm-Line $VmPw; Start-Sleep 7
+}
+function Vm-AgentLog([int]$Tail = 4) { Vm-Cmd -Line "powershell -NoProfile -Command `"Get-Content `$env:LOCALAPPDATA\LockMonitor\log.txt -Tail $Tail`"" -Name agentlog }
 function Vm-Type($Text) { & "$VmWs\vmcli.exe" $Vmx MKS sendKeySequence ($Text -replace '"', '\"') 2>&1 | Out-String }   # \" : PowerShell 5.1 does not escape quotes for native programs
 # Real mouse movement and clicks, sent through VMware's built-in VNC server like a physical pointing device. Needs these
 # lines in the vmx while the VM is off (and removed again afterwards): RemoteDisplay.vnc.enabled = "TRUE",

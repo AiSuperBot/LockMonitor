@@ -62,7 +62,7 @@ The highest-numbered screen (`\\.\DISPLAYn`), and from then on only that very mo
 - The kept monitor goes blank for a moment at Win+L, and a TV has to find its signal again.
 - While locked, the PC is kept awake and the displays are kept on. Windows has one display-power switch for all monitors, so the other monitors stay lit, showing the lock screen.
 - Apps must keep drawing while the PC is locked. Classic apps do. Chrome and Edge do with the policy above. Apps built on Electron may freeze; there is no switch for them from outside.
-- The picture is refreshed up to four times a second while it changes, and once a second while it is still.
+- The picture is refreshed up to four times a second while it changes, and once a second while it is still. Only the rows that changed go to the graphics card, and windows completely hidden behind another one are not captured.
 - If none of the monitor's windows can be drawn, the monitor says why instead of staying black.
 - Logs: `%LOCALAPPDATA%\LockMonitor\log.txt` has two lines per lock (what is shown and from when, how long the lock lasted and how many pictures) plus anything that went wrong. `%ProgramFiles%\LockMonitor\switch.log` has only what was out of the ordinary. Nothing about how you signed in is recorded.
 - `"%ProgramFiles%\LockMonitor\LockMonitor-Agent.exe" -selftest | more` checks the PC's graphics and window capture without changing anything.
@@ -107,8 +107,8 @@ The same by hand, in a Command Prompt in the source folder:
 set FW=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319
 set MD=%WINDIR%\System32\WinMetadata
 mkdir bin
-%FW%\csc.exe /nologo /target:winexe /optimize+ /highentropyva+ /out:bin\Switch-LastScreen.exe Switch-LastScreen.cs
-%FW%\csc.exe /nologo /target:winexe /optimize+ /highentropyva+ /out:bin\LockMonitor-Agent.exe /r:%MD%\Windows.Devices.winmd /r:%MD%\Windows.Graphics.winmd /r:%MD%\Windows.Foundation.winmd /r:%FW%\System.Runtime.dll /r:%FW%\System.Runtime.WindowsRuntime.dll /r:%FW%\System.Runtime.InteropServices.WindowsRuntime.dll Agent.cs
+%FW%\csc.exe /nologo /target:winexe /optimize+ /highentropyva+ /out:bin\Switch-LastScreen.exe Switch-LastScreen.cs Common.cs
+%FW%\csc.exe /nologo /target:winexe /optimize+ /highentropyva+ /out:bin\LockMonitor-Agent.exe /r:%MD%\Windows.Devices.winmd /r:%MD%\Windows.Graphics.winmd /r:%MD%\Windows.Foundation.winmd /r:%FW%\System.Runtime.dll /r:%FW%\System.Runtime.WindowsRuntime.dll /r:%FW%\System.Runtime.InteropServices.WindowsRuntime.dll Agent.cs Common.cs
 ```
 
 To check a build without changing anything: `bin\LockMonitor-Agent.exe -selftest | more`.
@@ -121,6 +121,7 @@ To install your own build, run `Install-Auto.ps1` in the source folder, which bu
 - `Build.ps1`: builds the two programs.
 - `Agent.cs`: the agent, `LockMonitor-Agent.exe`.
 - `Switch-LastScreen.cs`: the elevated helper, `Switch-LastScreen.exe`.
+- `Common.cs`: what both programs share, compiled into each, the version number included.
 - `vmtest\`: the harness used for the tests above. Its paths are those of the original test machine.
 
 Earlier versions also had a mode for a permanently dedicated monitor and a fallback that switched a monitor's input; both were removed in 0.2.0 and remain in the repository history (tag `v0.1.2`).

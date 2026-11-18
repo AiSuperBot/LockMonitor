@@ -1,4 +1,4 @@
-// LockMonitor agent. Install-Auto.ps1 compiles it to "%ProgramFiles%\LockMonitor\LockMonitor-Agent.exe" and has Windows
+// LockMonitor agent. Install-Auto.ps1 puts it into "%ProgramFiles%\LockMonitor\LockMonitor-Agent.exe" and has Windows
 // start it at sign-in with the user's normal rights. It waits and holds nothing. While the PC is unlocked it only notes
 // which windows are on the highest-numbered screen. At Win+L the elevated helper (Switch-LastScreen.exe, started by
 // Windows' own lock event) takes that screen off the Windows desktop; this program then owns the screen and redraws the
@@ -6,7 +6,7 @@
 //
 // The lock itself is not touched: no Windows file is patched, Win+L is not intercepted, nothing imitates the lock
 // screen. The kept screen shows pictures only: it has no pointer, no focus and takes no input. Windows are read, never
-// typed or clicked into; the one thing done to them is to give them back the size they had (see Pix.GiveBackSizes).
+// typed or clicked into; the one thing done to them is to give them back the size they had (see Pix.GiveBackSize).
 //
 //   LockMonitor-Agent.exe                     the agent (no window). Log: %LOCALAPPDATA%\LockMonitor\log.txt
 //   LockMonitor-Agent.exe -selftest | more    checks this PC's graphics and window capture; changes nothing
@@ -24,18 +24,14 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
-using Microsoft.Win32;
 using Windows.Devices.Display;
 using Windows.Devices.Display.Core;
 using Windows.Graphics;
 using Windows.Graphics.DirectX;
 using Windows.Graphics.DirectX.Direct3D11;
+using Forms = System.Windows.Forms;
 
-// shown in the file's Properties > Details, and in the log at every start
 [assembly: AssemblyTitle("LockMonitor agent: keeps one screen's windows showing while Windows is locked")]
-[assembly: AssemblyProduct("LockMonitor")]
-[assembly: AssemblyVersion("0.2.1")]
-[assembly: AssemblyFileVersion("0.2.1")]
 
 // Windows is still busy with the screen (it only just left the desktop): worth asking again at once.
 public class NotReady : Exception { public NotReady(string message) : base(message) { } }
@@ -45,21 +41,6 @@ public class NotReady : Exception { public NotReady(string message) : base(messa
 public interface IDisplayDeviceInterop {
     [PreserveSig] int CreateSharedHandle([MarshalAs(UnmanagedType.IUnknown)] object o, IntPtr sa, uint access, IntPtr name, out IntPtr handle);
     [PreserveSig] int OpenSharedHandle(IntPtr h, ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object o);
-}
-
-public static class Spec {   // DisplayConfigGetDeviceInfo(GET_MONITOR_SPECIALIZATION = 12): read-only
-    [StructLayout(LayoutKind.Sequential)] struct Req { public int type, size; public uint lo; public int hi; public uint id, flags; }
-    [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref Req r);
-    static int Flags(uint lo, int hi, uint id, out uint flags) {
-        Req r = new Req(); r.type = 12; r.size = Marshal.SizeOf(typeof(Req)); r.lo = lo; r.hi = hi; r.id = id;
-        int rc = DisplayConfigGetDeviceInfo(ref r); flags = r.flags; return rc;
-    }
-    // what Windows says about handing this screen to a program: is it off the desktop now, can this monitor be, can this Windows at all
-    public static string Get(uint lo, int hi, uint id) {
-        uint f; int rc = Flags(lo, hi, id, out f);
-        return rc != 0 ? "unknown (error " + rc + ")" : "off the desktop=" + (f & 1) + ", possible for this monitor=" + ((f >> 1) & 1) + ", possible on this Windows=" + ((f >> 2) & 1);
-    }
-    public static bool Off(uint lo, int hi, uint id) { uint f; return Flags(lo, hi, id, out f) == 0 && (f & 1) != 0; }   // connected and off the desktop
 }
 
 public static class Pwr {   // ES_CONTINUOUS 0x80000000 | ES_SYSTEM_REQUIRED 1 | ES_DISPLAY_REQUIRED 2; holds for the calling thread
@@ -99,14 +80,24 @@ public class Frame : IDisposable {
     }
     public void Clear() { PatBlt(Dc, 0, 0, W, H, 0x42); }   // 0x42 = BLACKNESS
 
-    // true when the picture differs from the one at the previous call (always true the first time)
-    public bool Changed() {
+    // The rows that differ from the picture at the previous call, as [top, bottom); false when none do (the first call
+    // reports all rows). The unchanged rows are found row by row from both ends; only the rows between are kept for the
+    // next comparison, and only they need to go to the GPU. Measured, 1920x1080: 0.9 ms when nothing changed, at most
+    // 1.4 ms otherwise (one native call costs 17 ns); copying the whole picture would cost 0.8 ms on top.
+    public bool Changed(out int top, out int bottom) {
         GdiFlush();   // Windows may still be holding drawing back; the memory is read directly below
-        UIntPtr n = (UIntPtr)(ulong)((long)Stride * H);
+        top = 0; bottom = H;
         if (last == IntPtr.Zero) last = Marshal.AllocHGlobal((IntPtr)((long)Stride * H));
-        else if (memcmp(Bits, last, n) == 0) return false;
-        CopyMemory(last, Bits, n); return true;
+        else {
+            while (top < H && Same(top)) top++;
+            if (top == H) return false;
+            while (Same(bottom - 1)) bottom--;   // stops at row top at the latest, which differs
+        }
+        CopyMemory(last + top * Stride, Bits + top * Stride, (UIntPtr)(ulong)((long)(bottom - top) * Stride));
+        return true;
     }
+    bool Same(int row) { return memcmp(Bits + row * Stride, last + row * Stride, (UIntPtr)(uint)Stride) == 0; }
+
     public void Dispose() {
         if (gone) return; gone = true;
         Gdi.Dispose();
@@ -116,31 +107,11 @@ public class Frame : IDisposable {
 }
 
 public static class Pix {
-    // ---- the session: locked or not, and the helper's notes ----
-    [DllImport("wtsapi32.dll")] static extern bool WTSQuerySessionInformation(IntPtr server, int session, int infoClass, out IntPtr buf, out int bytes);
-    [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr p);
     [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
     [DllImport("psapi.dll")] static extern bool EmptyWorkingSet(IntPtr process);
-    // Windows' own lock flag: WTSSessionInfoEx (25), SessionFlags at offset 16, 0 = locked, 1 = unlocked, -1 here = Windows
-    // did not answer. Whether the input desktop can be opened is no test: Windows draws the lock-screen picture on the
-    // user's own desktop (measured).
-    public static int Flags() { IntPtr p; int n; if (!WTSQuerySessionInformation(IntPtr.Zero, -1, 25, out p, out n)) return -1; int f = Marshal.ReadInt32(p, 16); WTSFreeMemory(p); return f; }
-    // Two definite answers; when Windows cannot say, both are false.
-    // Locked() decides about holding a screen and drawing on it: anything but a definite "locked" stops that.
-    // Unlocked() decides about asking for a held screen to be put back: only a definite "unlocked" does that.
-    public static bool Locked() { return Flags() == 0; }
-    public static bool Unlocked() { return Flags() == 1; }
-
-    // A note of the elevated side in HKLM\SOFTWARE\LockMonitor (only administrators can write there); null if absent.
-    static object Note(string name) {
-        using (RegistryKey hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64))
-        using (RegistryKey k = hklm.OpenSubKey(@"SOFTWARE\LockMonitor")) { return k == null ? null : k.GetValue(name); }
-    }
-    // The screen the helper holds off the desktop right now, as "adapterLow|adapterHigh|target|device|monitor path"; null if none.
-    public static string Taken() { return Note("Taken") as string; }
 
     // ---- windows: finding them and getting their live picture ----
-    [StructLayout(LayoutKind.Sequential)] struct RECT { public int l, t, r, b; }
+    [StructLayout(LayoutKind.Sequential)] internal struct RECT { public int l, t, r, b; }
     delegate bool EnumProc(IntPtr h, IntPtr p);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
@@ -149,10 +120,15 @@ public static class Pix {
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
+    [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr h, int cmd);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hgt, uint flags);
     [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
+    [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
+    [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr hmon, int type, out uint dpiX, out uint dpiY);
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int v, int size);
     [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, uint rop);
@@ -161,8 +137,6 @@ public static class Pix {
     [DllImport("gdi32.dll")] static extern bool StretchBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, int sw, int sh, uint rop);
     [DllImport("gdi32.dll")] static extern bool GdiFlush();
 
-    [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
-    [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr hmon, int type, out uint dpiX, out uint dpiY);
     // sizes and pictures in real pixels on every screen, whatever its scaling (-4 = per-monitor aware v2; older Windows lacks it)
     public static void DpiAware() {
         try { if (!SetProcessDpiAwarenessContext(new IntPtr(-4))) SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch (EntryPointNotFoundException) { }
@@ -182,56 +156,20 @@ public static class Pix {
     }
     public static Rectangle Visible(IntPtr hwnd) { RECT w, s; return Outline(hwnd, out w, out s) ? Rectangle.FromLTRB(s.l, s.t, s.r, s.b) : Rectangle.Empty; }
 
-    static Frame scratch;
-    // Draw a window's visible part into the box (x, y, w, h) of dst. Same size as the box: copied pixel for pixel.
-    // Any other size: fitted into the box, keeping its proportions. false when the window has no picture.
-    // 2 = PW_RENDERFULLCONTENT: the picture comes from the window compositor, so GPU-drawn apps (Chrome) work and the
-    // window may be covered by others. Measured: it keeps delivering fresh pictures while locked. Measured too: it
-    // always draws the whole window at the top-left corner of the bitmap, ignoring the DC's origin and clipping. Hence
-    // the detour through a bitmap of its own, from which the visible part is copied into place.
-    static bool Blit(IntPtr hwnd, Frame dst, int x, int y, int w, int h) {
-        RECT whole, seen;
-        if (w <= 0 || h <= 0 || !Outline(hwnd, out whole, out seen)) return false;
-        int ww = whole.r - whole.l, wh = whole.b - whole.t, fx = seen.l - whole.l, fy = seen.t - whole.t, fw = seen.r - seen.l, fh = seen.b - seen.t;
-        if (scratch == null || scratch.W < ww || scratch.H < wh) {   // kept between pictures, grown when a bigger window comes along
-            int nw = Math.Max(ww, scratch == null ? 0 : scratch.W), nh = Math.Max(wh, scratch == null ? 0 : scratch.H);
-            if (scratch != null) scratch.Dispose();
-            scratch = new Frame(nw, nh);
-        }
-        if (!PrintWindow(hwnd, scratch.Dc, 2)) return false;
-        if (fw == w && fh == h) return BitBlt(dst.Dc, x, y, w, h, scratch.Dc, fx, fy, 0x00CC0020);   // SRCCOPY
-        double k = Math.Min((double)w / fw, (double)h / fh);
-        int tw = Math.Max(1, (int)Math.Round(fw * k)), th = Math.Max(1, (int)Math.Round(fh * k));
-        SetStretchBltMode(dst.Dc, 4); SetBrushOrgEx(dst.Dc, 0, 0, IntPtr.Zero);   // 4 = HALFTONE: averages pixels when shrinking
-        return StretchBlt(dst.Dc, x + (w - tw) / 2, y + (h - th) / 2, tw, th, scratch.Dc, fx, fy, fw, fh, 0x00CC0020);
-    }
-
-    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hgt, uint flags);
-    // Windows shrinks or un-maximizes windows when it moves them to another screen (measured: a maximized browser arrived
-    // there in its smaller, restored size; enlarged to fit, it looked like a lower resolution). So every noted window is
-    // asked to take the size it had on its screen, in the corner of the screen it is on now (measured: a browser will not
-    // reach past the screen's edge from where Windows put it); nobody sees the desktop while the PC is locked.
-    // This is the only thing this program ever does to a window. It asks without waiting (0x4000), so a window that does
-    // not answer cannot hold the pictures up, and at most 3 times: one that will not take the size is fitted instead.
-    // When the screen returns, Windows itself puts each window back exactly as it was (measured: maximized again, and
-    // its un-maximized place and size untouched).
-    public static void GiveBackSizes(Snap s) {
-        foreach (Win w in s.Wins) {
-            RECT whole, seen;
-            if (w.Asked >= 3 || !IsWindow(w.H) || IsIconic(w.H) || !Outline(w.H, out whole, out seen)) continue;
-            int sw = seen.r - seen.l, sh = seen.b - seen.t;
-            if (sw == w.W && sh == w.Hgt) continue;
-            MONITORINFOEX mi = new MONITORINFOEX(); mi.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
-            if (!GetMonitorInfo(MonitorFromWindow(w.H, 2), ref mi)) continue;   // 2 = the nearest screen
-            w.Asked++;   // place and size include the invisible border the window has now; 4 = same stacking, 0x10 = no focus
-            SetWindowPos(w.H, IntPtr.Zero, mi.mon.l - (seen.l - whole.l), mi.mon.t - (seen.t - whole.t), w.W + (whole.r - whole.l - sw), w.Hgt + (whole.b - whole.t - sh), 0x4000 | 0x4 | 0x10);
-        }
-    }
-
-    // What was on the screen: its windows, top-most first, in the screen's own pixels. Check = not a lock but the setup's test.
-    public class Win { public IntPtr H; public int X, Y, W, Hgt, Asked; public string Title; }
+    // What was on the screen: its windows, top-most first, in the screen's own pixels (noted while unlocked).
     // Scale: the screen's display scaling in percent; OtherScale: that of another desktop screen when it differs, else 0.
+    // Check: not a lock but the setup's test.
     public class Snap { public string Device; public int W, H, Scale, OtherScale; public List<Win> Wins = new List<Win>(); public bool Check; }
+    // One window: noted place and size; and, set anew for every picture, how it is right now and where it goes.
+    public class Win {
+        public IntPtr H; public int X, Y, W, Hgt, Asked; public string Title;
+        internal RECT whole, seen; internal int bx, by, bw, bh; internal bool live;
+        // drawn pixel for pixel: its visible part is exactly the size of its place in the picture
+        internal bool Exact { get { return seen.r - seen.l == bw && seen.b - seen.t == bh; } }
+        // drawn exactly over all of o's place, so o's picture would not show
+        internal bool Covers(Win o) { return live && Exact && bx <= o.bx && by <= o.by && bx + bw >= o.bx + o.bw && by + bh >= o.by + o.bh; }
+    }
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct MONITORINFOEX { public int cbSize; public RECT mon, work; public uint flags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string device; }
     delegate bool MonProc(IntPtr hm, IntPtr dc, IntPtr rc, IntPtr data);
@@ -248,8 +186,7 @@ public static class Pix {
             if (!GetMonitorInfo(hm, ref mi)) return true;
             count++;
             uint dx, dy; scale[hm] = GetDpiForMonitor(hm, 0, out dx, out dy) == 0 ? (int)Math.Round(dx * 100.0 / 96) : 0;   // 0 = effective DPI; 96 is 100%
-            int p = mi.device.Length; while (p > 0 && char.IsDigit(mi.device[p - 1])) p--;
-            int n; if (int.TryParse(mi.device.Substring(p), out n) && n > bestN) { bestN = n; best = hm; bm = mi; }
+            int n = Common.Number(mi.device); if (n > bestN) { bestN = n; best = hm; bm = mi; }
             return true;
         }, IntPtr.Zero);
         if (best == IntPtr.Zero || count < 2) return null;
@@ -270,20 +207,80 @@ public static class Pix {
         return s;
     }
 
+    // Windows shrinks or un-maximizes windows when it moves them to another screen (measured: a maximized browser arrived
+    // there in its smaller, restored size; enlarged to fit, it looked like a lower resolution). So a window that has
+    // another size than noted is asked to take its noted size again, in the corner of the screen it is on now (measured:
+    // a browser will not reach past the screen's edge from where Windows put it); nobody sees the desktop while the PC is
+    // locked. This is the only thing this program ever does to a window. It asks without waiting (0x4000), so a window
+    // that does not answer cannot hold the pictures up, and at most 3 times: one that will not take the size is fitted
+    // instead. When the screen returns, Windows itself puts each window back exactly as it was (measured: maximized
+    // again, and its un-maximized place and size untouched).
+    static void GiveBackSize(Win w) {
+        w.Asked++;
+        // A window that Windows kept maximized on the other screen has that screen's size and refuses another one
+        // (measured: 1280x800 there against 1280x752 noted). It is un-maximized first, without being activated
+        // (4 = SW_SHOWNOACTIVATE), and asked for its size at the next picture.
+        if (IsZoomed(w.H)) { ShowWindowAsync(w.H, 4); return; }
+        MONITORINFOEX mi = new MONITORINFOEX(); mi.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+        if (!GetMonitorInfo(MonitorFromWindow(w.H, 2), ref mi)) return;   // 2 = the nearest screen
+        // place and size include the invisible border the window has now; 4 = same stacking, 0x10 = no focus
+        SetWindowPos(w.H, IntPtr.Zero, mi.mon.l - (w.seen.l - w.whole.l), mi.mon.t - (w.seen.t - w.whole.t),
+            w.W + (w.whole.r - w.whole.l) - (w.seen.r - w.seen.l), w.Hgt + (w.whole.b - w.whole.t) - (w.seen.b - w.seen.t), 0x4000 | 0x4 | 0x10);
+    }
+
+    static Frame scratch;
+    // Draw a window's visible part into its place in dst: pixel for pixel when the sizes match, else fitted into its place,
+    // keeping its proportions. false when the window has no picture.
+    // 2 = PW_RENDERFULLCONTENT: the picture comes from the window compositor, so GPU-drawn apps (Chrome) work and the
+    // window may be covered by others. Measured: it keeps delivering fresh pictures while locked. Measured too: it
+    // always draws the whole window at the top-left corner of the bitmap, ignoring the DC's origin and clipping. Hence
+    // the detour through a bitmap of its own, from which the visible part is copied into place; only a window without
+    // invisible borders that is exactly the whole picture (a full-screen browser) can be drawn straight into it.
+    static bool Blit(Win win, Frame dst) {
+        int x = win.bx, y = win.by, w = win.bw, h = win.bh;
+        RECT whole = win.whole, seen = win.seen;
+        int ww = whole.r - whole.l, wh = whole.b - whole.t, fx = seen.l - whole.l, fy = seen.t - whole.t, fw = seen.r - seen.l, fh = seen.b - seen.t;
+        bool exact = fw == w && fh == h;
+        if (exact && fw == ww && fh == wh && x == 0 && y == 0 && w == dst.W && h == dst.H) return PrintWindow(win.H, dst.Dc, 2);
+        if (scratch == null || scratch.W < ww || scratch.H < wh) {   // kept between pictures, grown when a bigger window comes along
+            int nw = Math.Max(ww, scratch == null ? 0 : scratch.W), nh = Math.Max(wh, scratch == null ? 0 : scratch.H);
+            if (scratch != null) scratch.Dispose();
+            scratch = new Frame(nw, nh);
+        }
+        if (!PrintWindow(win.H, scratch.Dc, 2)) return false;
+        if (exact) return BitBlt(dst.Dc, x, y, w, h, scratch.Dc, fx, fy, 0x00CC0020);   // SRCCOPY
+        double k = Math.Min((double)w / fw, (double)h / fh);
+        int tw = Math.Max(1, (int)Math.Round(fw * k)), th = Math.Max(1, (int)Math.Round(fh * k));
+        SetStretchBltMode(dst.Dc, 4); SetBrushOrgEx(dst.Dc, 0, 0, IntPtr.Zero);   // 4 = HALFTONE: averages pixels when shrinking
+        return StretchBlt(dst.Dc, x + (w - tw) / 2, y + (h - th) / 2, tw, th, scratch.Dc, fx, fy, fw, fh, 0x00CC0020);
+    }
+
     // Redraw the noted screen: every window's live picture at the place it had, stacked as it was. Returns how many were
     // drawn. Windows moved these windows to another screen when this one left the desktop; they are drawn where they were.
+    // Each window is looked at once per picture. A window completely behind another one is not captured at all (on the
+    // screen it was hidden too), and a window drawn over the whole picture leaves nothing below it to draw or to clear.
     public static int CaptureWindows(Snap s, Frame dst) {
-        dst.Clear();
         double k = Math.Min((double)dst.W / s.W, (double)dst.H / s.H);   // one factor for both directions: nothing gets stretched
-        double ox = (dst.W - s.W * k) / 2, oy = (dst.H - s.H * k) / 2; int drawn = 0;
-        for (int i = s.Wins.Count - 1; i >= 0; i--) {   // bottom-most first
+        double ox = (dst.W - s.W * k) / 2, oy = (dst.H - s.H * k) / 2;
+        int full = -1;   // the top-most window drawn over the whole picture, if there is one
+        for (int i = 0; i < s.Wins.Count; i++) {   // top-most first: how every window is right now
             Win w = s.Wins[i];
-            if (!IsWindow(w.H) || IsIconic(w.H)) continue;
-            if (Blit(w.H, dst, (int)Math.Round(ox + w.X * k), (int)Math.Round(oy + w.Y * k), (int)Math.Round(w.W * k), (int)Math.Round(w.Hgt * k))) drawn++;
+            w.bx = (int)Math.Round(ox + w.X * k); w.by = (int)Math.Round(oy + w.Y * k); w.bw = (int)Math.Round(w.W * k); w.bh = (int)Math.Round(w.Hgt * k);
+            w.live = w.bw > 0 && w.bh > 0 && IsWindow(w.H) && !IsIconic(w.H) && Outline(w.H, out w.whole, out w.seen);
+            if (!w.live) continue;
+            if (w.Asked < 3 && (w.seen.r - w.seen.l != w.W || w.seen.b - w.seen.t != w.Hgt)) GiveBackSize(w);
+            if (full < 0 && w.Exact && w.bx <= 0 && w.by <= 0 && w.bx + w.bw >= dst.W && w.by + w.bh >= dst.H) full = i;
+        }
+        if (full < 0) dst.Clear();
+        int drawn = 0;
+        for (int i = full >= 0 ? full : s.Wins.Count - 1; i >= 0; i--) {   // bottom-most first
+            if (!s.Wins[i].live || Hidden(s, i)) continue;
+            if (Blit(s.Wins[i], dst)) drawn++;
         }
         GdiFlush();
         return drawn;
     }
+    static bool Hidden(Snap s, int i) { for (int j = 0; j < i; j++) if (s.Wins[j].Covers(s.Wins[i])) return true; return false; }
 
     public static void Notice(Frame b, string text) {
         using (Graphics g = Graphics.FromImage(b.Gdi))
@@ -302,11 +299,11 @@ public static class Pix {
     public static Snap WaitForLock(bool mayCheck) {
         GC.Collect(); EmptyWorkingSet(GetCurrentProcess());   // this wait lasts hours: hand back the memory the last lock used
         int kept = 0;
-        while (!Locked()) {
-            string held = Taken();
+        while (!Common.Locked()) {
+            string held = Common.Taken();
             if (held == null) { kept = 0; noted = latest; latest = Snapshot(); }
-            else if (mayCheck && Note("Check") != null) { Snap c = new Snap(); c.Check = true; return c; }
-            else if (++kept >= 8 && Unlocked() && AskToGiveBack(held)) kept = -7;   // asked: allow 10 s before asking again
+            else if (mayCheck && Common.Note("Check") != null) { Snap c = new Snap(); c.Check = true; return c; }
+            else if (++kept >= 8 && Common.Unlocked() && AskToGiveBack(held)) kept = -7;   // asked: allow 10 s before asking again
             Thread.Sleep(700);
         }
         return noted ?? latest ?? new Snap();
@@ -318,8 +315,8 @@ public static class Pix {
     // program has no rights to do that itself. true when asked.
     static bool AskToGiveBack(string held) {
         try {
-            string[] h = held.Split('|');
-            if (!Spec.Off(uint.Parse(h[0]), int.Parse(h[1]), uint.Parse(h[2]))) return false;
+            uint lo, id; int hi; Common.Parse(held, out lo, out hi, out id);
+            if (Common.OffDesktop(lo, hi, id) != true) return false;
             ProcessStartInfo p = new ProcessStartInfo(Environment.SystemDirectory + @"\schtasks.exe", "/run /tn LockMonitor-Give");
             p.UseShellExecute = false; p.CreateNoWindow = true;
             using (Process.Start(p)) { }
@@ -346,6 +343,7 @@ public class Gfx : IDisposable {
     [StructLayout(LayoutKind.Sequential)] struct TexDesc { public uint W, H, Mips, ArraySize, Format, SampCount, SampQuality, Usage, Bind, Cpu, Misc; }
     [StructLayout(LayoutKind.Sequential)] struct Mapped { public IntPtr Data; public uint RowPitch, DepthPitch; }
     [StructLayout(LayoutKind.Sequential)] struct QDesc { public uint Query, Misc; }
+    [StructLayout(LayoutKind.Sequential)] struct Box { public uint Left, Top, Front, Right, Bottom, Back; }
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct AdapterDesc { [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string Name; public uint Vendor, Device, SubSys, Rev; public IntPtr Vram, SysRam, SharedRam; public long Luid; }
 
@@ -357,7 +355,7 @@ public class Gfx : IDisposable {
     delegate int FnTex(IntPtr self, ref TexDesc d, IntPtr init, out IntPtr tex);
     delegate int FnQuery(IntPtr self, ref QDesc d, out IntPtr q);
     delegate int FnShare(IntPtr self, IntPtr attrs, uint access, IntPtr name, out IntPtr h);
-    delegate void FnUpdate(IntPtr self, IntPtr res, uint sub, IntPtr box, IntPtr data, uint rowPitch, uint depthPitch);
+    delegate void FnUpdate(IntPtr self, IntPtr res, uint sub, ref Box box, IntPtr data, uint rowPitch, uint depthPitch);
     delegate void FnCopy(IntPtr self, IntPtr dst, IntPtr src);
     delegate int FnMap(IntPtr self, IntPtr res, uint sub, uint type, uint flags, out Mapped m);
     delegate void FnUnmap(IntPtr self, IntPtr res, uint sub);
@@ -410,9 +408,11 @@ public class Gfx : IDisposable {
         try { return OpenHandle(h); } finally { CloseHandle(h); }
     }
 
-    // bits: BGRA rows of exactly the texture's size. Returns once the GPU has the picture, so it can be shown.
-    public void Upload(IntPtr tex, IntPtr bits, int stride) {
-        update(ctx, tex, 0, IntPtr.Zero, bits, (uint)stride, 0);
+    // Rows [top, bottom) of the picture into the texture of the same size. Returns once the GPU has them, so they can be shown.
+    public void Upload(IntPtr tex, Frame f, int top, int bottom) {
+        if (bottom <= top) return;
+        Box b = new Box(); b.Top = (uint)top; b.Right = (uint)f.W; b.Bottom = (uint)bottom; b.Back = 1;
+        update(ctx, tex, 0, ref b, f.Bits + top * f.Stride, (uint)f.Stride, 0);
         end(ctx, query);
         Stopwatch sw = Stopwatch.StartNew(); int done, hr;
         while ((hr = getData(ctx, query, out done, 4, 0)) != 0) {
@@ -423,7 +423,21 @@ public class Gfx : IDisposable {
         }
     }
 
-    // texture shared by NT handle (as a DisplaySurface is) -> upload two known pixels -> read them back
+    // A known colour into the texture, then one pixel of another colour as a one-row upload, and both read back: the proof
+    // that the texture takes whole pictures and changed rows. w and h: the texture's size.
+    public bool RoundTrip(IntPtr tex, int w, int h, out string seen) {
+        using (Frame f = new Frame(w, h)) {
+            using (Graphics g = Graphics.FromImage(f.Gdi)) g.Clear(Color.FromArgb(10, 20, 30));
+            Upload(tex, f, 0, h);
+            f.Gdi.SetPixel(5, 7, Color.FromArgb(200, 100, 50));
+            Upload(tex, f, 7, 8);
+        }
+        int p0 = ReadPixel(tex, 0, 0) & 0xFFFFFF, p1 = ReadPixel(tex, 5, 7) & 0xFFFFFF;
+        seen = "pixels 0x" + p0.ToString("X6") + " / 0x" + p1.ToString("X6");
+        return p0 == 0x0A141E && p1 == 0xC86432;
+    }
+
+    // the same with a texture shared by NT handle, as a display surface is
     public bool SelfTest(out string seen) {
         TexDesc d = new TexDesc(); d.W = 64; d.H = 32; d.Mips = 1; d.ArraySize = 1; d.Format = 87; d.SampCount = 1; d.Bind = 0x20; d.Misc = 0x2 | 0x800;
         IntPtr tex, res1, h;
@@ -432,15 +446,7 @@ public class Gfx : IDisposable {
         Check(Slot<FnQI>(tex, 0)(tex, ref iidRes1, out res1), "IDXGIResource1");
         Check(Slot<FnShare>(res1, 13)(res1, IntPtr.Zero, 0x80000001, IntPtr.Zero, out h), "IDXGIResource1.CreateSharedHandle");
         IntPtr opened = OpenHandle(h); CloseHandle(h);
-        using (Frame f = new Frame(64, 32)) {
-            using (Graphics g = Graphics.FromImage(f.Gdi)) g.Clear(Color.FromArgb(10, 20, 30));
-            f.Gdi.SetPixel(5, 7, Color.FromArgb(200, 100, 50));
-            Upload(opened, f.Bits, f.Stride);
-        }
-        int p0 = ReadPixel(opened, 0, 0) & 0xFFFFFF, p1 = ReadPixel(opened, 5, 7) & 0xFFFFFF;
-        Release(opened); Release(res1); Release(tex);
-        seen = "pixels 0x" + p0.ToString("X6") + " / 0x" + p1.ToString("X6");
-        return p0 == 0x0A141E && p1 == 0xC86432;
+        try { return RoundTrip(opened, 64, 32, out seen); } finally { Release(opened); Release(res1); Release(tex); }
     }
 
     // What kind of texture this is (ID3D11Texture2D::GetDesc, slot 10).
@@ -449,8 +455,8 @@ public class Gfx : IDisposable {
         return d.W + "x" + d.H + " format " + d.Format + " usage " + d.Usage + " bind 0x" + d.Bind.ToString("X") + " misc 0x" + d.Misc.ToString("X");
     }
 
-    // One pixel of a texture, read back through a staging copy: the proof that an upload arrived.
-    public int ReadPixel(IntPtr tex, int x, int y) {
+    // One pixel of a texture, read back through a staging copy.
+    int ReadPixel(IntPtr tex, int x, int y) {
         TexDesc d; Slot<FnTexDesc>(tex, 10)(tex, out d);
         d.Mips = 1; d.ArraySize = 1; d.SampCount = 1; d.SampQuality = 0; d.Usage = 3; d.Bind = 0; d.Cpu = 0x20000; d.Misc = 0;   // STAGING, CPU read
         IntPtr st; Check(createTex(dev, ref d, IntPtr.Zero, out st), "CreateTexture2D(staging)");
@@ -532,7 +538,7 @@ public static class Show {
     }
 
     static void Run(string held, Pix.Snap noted, string notice, string framesTo, Func<bool> go, Func<string> firstLine, ref int shown) {
-        string[] h = held.Split('|'); uint lo = uint.Parse(h[0]); int hi = int.Parse(h[1]); uint id = uint.Parse(h[2]);
+        uint lo, id; int hi; Common.Parse(held, out lo, out hi, out id);
         DisplayManager dm = DisplayManager.Create(DisplayManagerOptions.None);
         Gfx gfx = null; Frame frame = null; IntPtr[] tex = new IntPtr[2];
         DisplayDevice dev = null; DisplaySource src = null; DisplayTaskPool pool = null;
@@ -578,9 +584,9 @@ public static class Show {
             }
             if (!Pwr.Keep(true)) Agent.Log("Windows refused the request to keep the displays on: the picture may go dark with them");
             frame = new Frame(w, hgt);
-            int i = 0, still = 0; bool first = true, said = false;
+            int i = 0, still = 0, top, bottom; bool first = true, said = false;
+            int[] staleTop = { 0, 0 }, staleBottom = { hgt, hgt };   // the rows each of the two surfaces still lacks: all of them at first
             while (go()) {
-                if (noted != null) Pix.GiveBackSizes(noted);
                 int drawn = noted != null && noted.Wins.Count > 0 ? Pix.CaptureWindows(noted, frame) : 0;
                 if (drawn == 0) {   // say why the screen is empty, on the screen itself and once in the log
                     string why = notice != null ? notice
@@ -589,11 +595,14 @@ public static class Show {
                     Pix.Notice(frame, why);
                     if (!said && notice == null && noted.Wins.Count > 0) { said = true; Agent.Log("no window picture: " + why.Replace('\n', ' ')); }
                 }
-                if (frame.Changed()) {   // an unchanged picture is neither uploaded nor shown again
+                if (frame.Changed(out top, out bottom)) {   // an unchanged picture is neither uploaded nor shown again
                     still = 0;
                     if (framesTo != null) { if (shown % 8 == 0) frame.Gdi.Save(Path.Combine(framesTo, "frame-" + shown.ToString("0000") + ".png"), ImageFormat.Png); }
                     else {
-                        gfx.Upload(tex[i], frame.Bits, frame.Stride);
+                        // the pictures alternate between two surfaces, so each one gets every row changed since it was last shown
+                        for (int k = 0; k < 2; k++) { staleTop[k] = Math.Min(staleTop[k], top); staleBottom[k] = Math.Max(staleBottom[k], bottom); }
+                        gfx.Upload(tex[i], frame, staleTop[i], staleBottom[i]);
+                        staleTop[i] = hgt; staleBottom[i] = 0;
                         DisplayTask task = pool.CreateTask(); task.SetScanout(scan[i]);
 #pragma warning disable 618   // Windows 11 marks ExecuteTask as superseded; it is the call Windows 10 has too, and the one proven on real hardware
                         pool.ExecuteTask(task);
@@ -613,8 +622,9 @@ public static class Show {
                         }
                     }
                 } else still++;
-                // windows have to be asked for their picture: 4 times a second while it changes, once a second after 2 s without change
-                if (!Pix.SleepWhile(go, still >= 8 ? 1000 : 250)) break;
+                // windows have to be asked for their picture: 4 times a second while it changes, once a second after 2 s
+                // without change, and once a second when nothing can be drawn (the notice changes with its clock only)
+                if (!Pix.SleepWhile(go, still >= 8 || drawn == 0 ? 1000 : 250)) break;
             }
         } finally {
             Pwr.Keep(false);
@@ -631,15 +641,8 @@ public static class Agent {
     static readonly string Version = typeof(Agent).Assembly.GetName().Version.ToString(3);
     static string logFile;
 
-    // A few lines per lock at most; the file keeps its newer half when it passes 256 KB.
-    public static void Log(string m) {
-        if (logFile == null) { Console.WriteLine(m); return; }
-        try {
-            FileInfo f = new FileInfo(logFile);
-            if (f.Exists && f.Length > 262144) { string[] all = File.ReadAllLines(logFile); File.WriteAllLines(logFile, new List<string>(all).GetRange(all.Length / 2, all.Length - all.Length / 2)); }
-            File.AppendAllText(logFile, DateTime.Now.ToString("s") + " " + m + Environment.NewLine);
-        } catch (Exception) { }   // a log that cannot be written must not stop the pictures
-    }
+    // A few lines per lock at most (see Common.Log); on the console for -selftest.
+    public static void Log(string m) { if (logFile == null) Console.WriteLine(m); else Common.Log(logFile, m); }
 
     static int Main(string[] args) {
         Pix.DpiAware();
@@ -665,13 +668,13 @@ public static class Agent {
             if (noted.Check) { checkedOnce = true; Check(framesTo); continue; }
             Stopwatch locked = Stopwatch.StartNew(), since = null;
             int fails = 0, shown = 0; bool freed = false; HashSet<string> early = new HashSet<string>();
-            while (Pix.Locked()) {
-                string held = Pix.Taken();
+            while (Common.Locked()) {
+                string held = Common.Taken();
                 if (held == null) { Thread.Sleep(250); continue; }   // nothing to do until the helper has freed the screen
                 freed = true; if (since == null) since = Stopwatch.StartNew();
                 Stopwatch ran = Stopwatch.StartNew();
                 try {
-                    Show.Pictures(held, noted, null, framesTo, Pix.Locked,
+                    Show.Pictures(held, noted, null, framesTo, Common.Locked,
                         () => "showing " + noted.Wins.Count + " window(s) of " + noted.Device + ", " + locked.Elapsed.TotalSeconds.ToString("0.0") + " s after the lock", ref shown);
                 } catch (Exception e) {
                     if (ran.Elapsed.TotalSeconds > 60) { fails = 0; early.Clear(); since.Restart(); }   // it had been working: a new problem, not the old one again
@@ -679,7 +682,7 @@ public static class Agent {
                     // after 2 s, 4 s, ... at most a minute: no busy loop, no flood in the log
                     if (e is NotReady && since.Elapsed.TotalSeconds < 20) { if (early.Add(e.Message)) Log("not ready yet: " + e.Message); Thread.Sleep(200); continue; }
                     fails++; Log(e is NotReady || e is InvalidOperationException ? e.Message : e.GetType().Name + ": " + e.Message);
-                    Pix.SleepWhile(Pix.Locked, 1000 * Math.Min(60, 2 * fails));
+                    Pix.SleepWhile(Common.Locked, 1000 * Math.Min(60, 2 * fails));
                 }
             }
             if (noted.Device != null || freed)   // on a single-screen desktop there is nothing to say
@@ -695,11 +698,11 @@ public static class Agent {
     static void Check(string framesTo) {
         Stopwatch t = Stopwatch.StartNew(); int shown = 0; string why = "the screen was not freed";
         while (shown == 0 && t.Elapsed.TotalSeconds < 12) {
-            string held = Pix.Taken(); if (held == null) break;
+            string held = Common.Taken(); if (held == null) break;
             Stopwatch on = Stopwatch.StartNew();
             try {
                 Show.Pictures(held, null, "LockMonitor test picture\nWhen the PC is locked, this screen keeps showing its windows.", framesTo,
-                    () => on.Elapsed.TotalSeconds < 4 && Pix.Taken() != null, () => "check: the test picture is on the screen", ref shown);
+                    () => on.Elapsed.TotalSeconds < 4 && Common.Taken() != null, () => "check: the test picture is on the screen", ref shown);
             } catch (Exception e) { why = e.Message; Thread.Sleep(e is NotReady ? 200 : 1000); }
         }
         if (shown == 0) Log("check: no picture: " + why);
@@ -714,6 +717,17 @@ public static class Agent {
     static bool Near(Color c, int r, int g, int b) { return Math.Abs(c.R - r) <= 3 && Math.Abs(c.G - g) <= 3 && Math.Abs(c.B - b) <= 3; }
     static string Rgb(Color c) { return c.R + "," + c.G + "," + c.B; }
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+    static readonly Color Orange = Color.FromArgb(200, 100, 50), Blue = Color.FromArgb(40, 60, 200), Green = Color.FromArgb(30, 160, 60);
+    static Forms.Form TestWindow(int x, int y, int w, int h, Color c, bool framed) {
+        Forms.Form f = new Forms.Form();
+        f.Text = "LockMonitor self-test"; f.StartPosition = Forms.FormStartPosition.Manual; f.ShowInTaskbar = false; f.BackColor = c;
+        if (!framed) f.FormBorderStyle = Forms.FormBorderStyle.None;
+        f.SetBounds(x, y, w, h);
+        ShowWindow(f.Handle, 4);   // shown without taking the focus
+        return f;
+    }
+    static void Settle() { Forms.Application.DoEvents(); Thread.Sleep(400); Forms.Application.DoEvents(); }
+    static Pix.Win Noted(Forms.Form f, int x, int y, Rectangle v) { Pix.Win w = new Pix.Win(); w.H = f.Handle; w.X = x; w.Y = y; w.W = v.Width; w.Hgt = v.Height; return w; }
 
     static int SelfTest() {
         Console.WriteLine("LockMonitor " + Version + " self-test. Nothing is changed.");
@@ -723,27 +737,22 @@ public static class Agent {
                 if (!t.IsConnected) continue;
                 if (any == null) any = t;
                 DisplayAdapterId a = t.Adapter.Id;
-                Console.WriteLine("screen " + (t.UsageKind + ", target " + t.AdapterRelativeId).PadRight(45) + ": " + Spec.Get(a.LowPart, a.HighPart, t.AdapterRelativeId));
+                Console.WriteLine("screen " + (t.UsageKind + ", target " + t.AdapterRelativeId).PadRight(45) + ": " + Common.Describe(a.LowPart, a.HighPart, t.AdapterRelativeId));
             }
             if (any == null) { Console.WriteLine("no screen is connected"); return 1; }
             DisplayAdapterId id = any.Adapter.Id;
             using (Gfx g = new Gfx(id.LowPart, id.HighPart)) {
                 Console.WriteLine("graphics adapter".PadRight(52) + ": " + g.AdapterName);
-                string seen; bool ok = g.SelfTest(out seen);
-                Line("picture to a shared GPU texture and back", ok, seen);
-                // a real display surface, allocated but never shown, must open as a texture, take a picture and give it back
+                string seen;
+                Line("picture to a shared GPU texture and back", g.SelfTest(out seen), seen);
+                // a real display surface, allocated but never shown, must open as a texture, take pictures and give them back
                 try {
                     Direct3DMultisampleDescription ms = new Direct3DMultisampleDescription(); ms.Count = 1;
                     DisplayPrimaryDescription desc = new DisplayPrimaryDescription(256, 128, DirectXPixelFormat.B8G8R8A8UIntNormalized, DirectXColorSpace.RgbFullG22NoneP709, false, ms);
                     DisplayDevice dev = dm.CreateDisplayDevice(any.Adapter);
                     IntPtr tex = g.OpenSurface(dev, dev.CreatePrimary(any, desc));
-                    using (Frame f = new Frame(256, 128)) {
-                        using (Graphics gr = Graphics.FromImage(f.Gdi)) gr.Clear(Color.FromArgb(200, 100, 50));
-                        g.Upload(tex, f.Bits, f.Stride);
-                    }
-                    int px = g.ReadPixel(tex, 100, 60) & 0xFFFFFF;
-                    Line("picture to a display surface and back", px == 0xC86432, "pixel 0x" + px.ToString("X6") + ", surface " + g.Describe(tex));
-                    Gfx.Free(tex);
+                    try { Line("picture to a display surface and back", g.RoundTrip(tex, 256, 128, out seen), seen + ", surface " + g.Describe(tex)); }
+                    finally { Gfx.Free(tex); }
                 } catch (Exception e) { Line("picture to a display surface and back", false, e.Message.Trim() + ". This display driver cannot give a screen to a program"); }
             }
         }
@@ -755,30 +764,50 @@ public static class Agent {
         bool kept = Pwr.Keep(true); Pwr.Keep(false);
         Line("request to keep PC and displays on", kept, "");
 
-        // the picture path, against a small window of our own in a known colour
-        using (System.Windows.Forms.Form form = new System.Windows.Forms.Form())
+        // the picture path, against windows of our own in known colours
+        using (Forms.Form a = TestWindow(60, 60, 320, 200, Orange, true), b = TestWindow(120, 100, 120, 90, Blue, true))
         using (Frame shot = new Frame(640, 400)) {
-            form.Text = "LockMonitor self-test"; form.StartPosition = System.Windows.Forms.FormStartPosition.Manual;
-            form.SetBounds(60, 60, 320, 200); form.BackColor = Color.FromArgb(200, 100, 50); form.ShowInTaskbar = false;
-            ShowWindow(form.Handle, 4);   // shown without taking the focus
-            System.Windows.Forms.Application.DoEvents(); Thread.Sleep(400); System.Windows.Forms.Application.DoEvents();
-            Rectangle v = Pix.Visible(form.Handle);
+            Settle();
+            Rectangle va = Pix.Visible(a.Handle);
             Pix.Snap note = new Pix.Snap(); note.W = 640; note.H = 400;
-            Pix.Win win = new Pix.Win(); win.H = form.Handle; win.X = 100; win.Y = 50; win.W = v.Width; win.Hgt = v.Height; note.Wins.Add(win);
-            int drawn = Pix.CaptureWindows(note, shot);
-            Color inside = shot.Gdi.GetPixel(100 + v.Width / 2, 50 + v.Height - 12), left = shot.Gdi.GetPixel(96, 50 + v.Height - 12), below = shot.Gdi.GetPixel(100 + v.Width / 2, 50 + v.Height + 4);
+            Pix.Win wa = Noted(a, 100, 50, va); note.Wins.Add(wa);
+            int drawn = Pix.CaptureWindows(note, shot), top, bottom;
+            Color inside = shot.Gdi.GetPixel(100 + va.Width / 2, 50 + va.Height - 12), left = shot.Gdi.GetPixel(96, 50 + va.Height - 12), below = shot.Gdi.GetPixel(100 + va.Width / 2, 50 + va.Height + 4);
             Line("window redrawn in its place, pixel for pixel", drawn == 1 && Near(inside, 200, 100, 50) && Near(left, 0, 0, 0) && Near(below, 0, 0, 0), "inside " + Rgb(inside) + ", left " + Rgb(left) + ", below " + Rgb(below));
-            Line("an unchanged picture is recognised", shot.Changed() && Pix.CaptureWindows(note, shot) == 1 && !shot.Changed(), "");
-            win.W = 200; win.Hgt = 300;   // another size than noted (Windows resized it on another screen): fitted into its place
+            Line("an unchanged picture is recognised", shot.Changed(out top, out bottom) && Pix.CaptureWindows(note, shot) == 1 && !shot.Changed(out top, out bottom), "");
+            shot.Gdi.SetPixel(10, 123, Color.White);
+            bool band = shot.Changed(out top, out bottom) && top == 123 && bottom == 124;
+            string rows = "rows " + top + " to " + bottom;
+            Line("only the changed rows are reported", band && !shot.Changed(out top, out bottom), rows);
+            note.Wins.Add(Noted(b, 130, 80, Pix.Visible(b.Handle)));   // below the first window, inside its place
+            drawn = Pix.CaptureWindows(note, shot);
+            Line("a window hidden behind another is not captured", drawn == 1, "drawn " + drawn);
+            note.Wins.RemoveAt(1);
+            wa.W = va.Width - 40; wa.Hgt = va.Height - 30;   // as if Windows had resized it on another screen: it is asked for the noted size
+            Pix.CaptureWindows(note, shot); Forms.Application.DoEvents();
+            Rectangle now = Pix.Visible(a.Handle);
+            Line("a window of another size is given back its size", now.Width == wa.W && now.Height == wa.Hgt, "now " + now.Width + "x" + now.Height + ", asked " + wa.W + "x" + wa.Hgt);
+            wa.W = 200; wa.Hgt = 300; wa.Asked = 3;   // one that will not take its size: fitted into its place, proportions kept
             drawn = Pix.CaptureWindows(note, shot);
             Color fit = shot.Gdi.GetPixel(200, 215), outside = shot.Gdi.GetPixel(200, 60);
-            Line("window of another size fitted into its place", drawn == 1 && Near(fit, 200, 100, 50) && Near(outside, 0, 0, 0) && shot.Changed(), "inside " + Rgb(fit) + ", outside " + Rgb(outside));
-            form.Close();
+            Line("a window of another size is fitted into its place", drawn == 1 && Near(fit, 200, 100, 50) && Near(outside, 0, 0, 0), "inside " + Rgb(fit) + ", outside " + Rgb(outside));
+            a.Close(); b.Close();
             Line("a closed window is left out", Pix.CaptureWindows(note, shot) == 0, "");
+        }
+        using (Forms.Form c = TestWindow(0, 0, 640, 400, Green, false)) {   // borderless, like a full-screen browser
+            Settle();
+            Rectangle vc = Pix.Visible(c.Handle);
+            using (Frame shot = new Frame(vc.Width, vc.Height)) {
+                Pix.Snap note = new Pix.Snap(); note.W = vc.Width; note.H = vc.Height; note.Wins.Add(Noted(c, 0, 0, vc));
+                Pix.Notice(shot, "under the window");   // something in the picture already: the window must cover all of it
+                int drawn = Pix.CaptureWindows(note, shot);
+                Color p1 = shot.Gdi.GetPixel(2, 2), p2 = shot.Gdi.GetPixel(vc.Width - 3, vc.Height - 3);
+                Line("a window over the whole picture fills it", drawn == 1 && Near(p1, 30, 160, 60) && Near(p2, 30, 160, 60), "corners " + Rgb(p1) + " / " + Rgb(p2));
+            }
         }
         Pix.Snap s = Pix.Snapshot();
         Console.WriteLine("screen that would be kept".PadRight(52) + ": " + (s == null ? "none: the desktop has a single screen" : s.Device + " " + s.W + "x" + s.H + ", " + s.Wins.Count + " window(s) on it now"));
-        Console.WriteLine("held by the helper now / PC locked".PadRight(52) + ": " + (Pix.Taken() ?? "nothing") + " / " + Pix.Locked());
+        Console.WriteLine("held by the helper now / PC locked".PadRight(52) + ": " + (Common.Taken() ?? "nothing") + " / " + Common.Locked());
         Console.WriteLine(failed == 0 ? "All checks passed." : failed + " check(s) FAILED.");
         return failed == 0 ? 0 : 1;
     }
