@@ -4,7 +4,7 @@ Press **Win+L** and one monitor keeps showing its windows, live, while Windows i
 
 The lock is the genuine Windows lock. No Windows file is patched, Win+L is not intercepted, there is no imitation lock screen, and signing in works exactly as before. The kept monitor shows pictures only: it has no pointer, no keyboard focus and takes no input.
 
-**Status: pre-release.** It works on real hardware: version 0.1.2 was run on a laptop with a TV on HDMI (Intel Iris Xe, Windows 11 Enterprise). Since version 0.2.0 the background program is a small compiled one that makes the same display calls; it has been through all the tests below in a virtual machine, and the setup tests it live on your PC.
+**Status: pre-release.** It works on real hardware: version 0.2.6 on a desktop PC with Windows 10 Enterprise and a TV on a VGA-to-HDMI converter (Intel UHD 770), and version 0.1.2 on a laptop with a TV on HDMI (Intel Iris Xe, Windows 11 Enterprise). It has been through all the tests below in virtual machines, and the setup tests it live on your PC.
 
 ## Requirements
 
@@ -26,7 +26,7 @@ The same command in the source code (the repository, or a release's "Source code
 
 The setup ends with a live test: the screen that will be kept goes dark for a few seconds and shows a test picture. If the test fails, the setup says why and removes everything again.
 
-Then sign out and back in once, and restart Chrome and Edge once. After that, just press Win+L.
+Then do what the setup lists at its end, once: on Windows 11 sign out and back in, and restart Chrome and Edge if they are running (`chrome://restart` or `edge://restart` in the address bar brings the tabs back). After that, just press Win+L.
 
 To update, or after changing monitors, run the same command again. To undo everything, including the two settings it changed:
 
@@ -48,7 +48,7 @@ The highest-numbered screen (`\\.\DISPLAYn`), and from then on only that very mo
 
 - Two programs in `%ProgramFiles%\LockMonitor`: `LockMonitor-Agent.exe` and `Switch-LastScreen.exe`.
 - Three scheduled tasks for your account: `LockMonitor-Agent`, `LockMonitor-Take`, `LockMonitor-Give`.
-- The Windows setting "Minimize windows when a monitor is disconnected" is turned off for your account. With it on, Windows minimizes the windows of the monitor that leaves the desktop and there is nothing left to show.
+- Windows 11 only: the setting "Minimize windows when a monitor is disconnected" is turned off for your account. With it on, Windows minimizes the windows of the monitor that leaves the desktop and there is nothing left to show.
 - The Chrome and Edge policy `WindowOcclusionEnabled` is set to 0. These browsers stop drawing when the PC is locked, and this policy is their own switch for that. They will then say "managed by your organization". `-LeaveBrowsers` skips this.
 
 `-Remove` puts both settings back to what they were. It leaves the log in `%LOCALAPPDATA%\LockMonitor` for you to delete: the setup runs as administrator and does not delete in your own folders.
@@ -61,7 +61,7 @@ The highest-numbered screen (`\\.\DISPLAYn`), and from then on only that very mo
   - If the other screens use a different scaling (Settings > System > Display > Scale), apps draw their windows for that scaling and everything looks larger or smaller. The same scaling on all screens gives an identical picture. The log says so when this applies.
 - The kept monitor goes blank for a moment at Win+L, and a TV has to find its signal again.
 - While locked, the PC is kept awake and the displays are kept on. Windows has one display-power switch for all monitors, so the other monitors stay lit, showing the lock screen.
-- Apps must keep drawing while the PC is locked. Classic apps do. Chrome and Edge do with the policy above. Apps built on Electron may freeze; there is no switch for them from outside.
+- Apps must keep drawing while the PC is locked. Classic apps do. Chrome and Edge do with the policy above, from their next start: one that has run since before the setup freezes at a lock, its page dark (the log then says so). Apps built on Electron may freeze; there is no switch for them from outside.
 - The picture is refreshed up to four times a second while it changes, and once a second while it is still. Only the rows that changed go to the graphics card, and windows completely hidden behind another one are not captured.
 - If none of the monitor's windows can be drawn, the monitor says why instead of staying black.
 - Logs: `%LOCALAPPDATA%\LockMonitor\log.txt` has two lines per lock (what is shown and from when, how long the lock lasted and how many pictures), on Windows 10 a third (how many windows were put back), plus anything that went wrong. `%ProgramFiles%\LockMonitor\switch.log` has only what was out of the ordinary. Nothing about how you signed in is recorded.
@@ -84,11 +84,10 @@ Tested in a VMware guest (Windows 11 Enterprise LTSC 2024), with real key presse
 
 Tested in a VMware guest with Windows 10 Enterprise 22H2 (build 19045), from version 0.2.6: the setup and its live test, lock and unlock with a normal and a maximized window on the kept screen (both back in place afterwards, the focus left where it was), the kept monitor unplugged during a lock, and a restart while locked.
 
-Tested on real hardware (a laptop with a TV, by the first user): the edition requirement, and the picture with version 0.1.2.
+Tested on real hardware, by the first user: the edition requirement and the picture with version 0.1.2 (laptop with a TV, Windows 11); the picture with version 0.2.6 (desktop PC with Windows 10, Grafana in Chrome on a TV).
 
 Not tested:
 
-- the compiled agent (version 0.2.0 and later) putting the picture on a real monitor (the setup's live test does exactly that on your PC), and Windows 10 on real hardware
 - a PC with two graphics adapters, sleep and resume while locked, Electron apps
 - whether the number Windows Settings shows for a monitor equals its `\\.\DISPLAYn` number on your PC (the test picture shows which monitor it is)
 

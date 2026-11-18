@@ -1,0 +1,33 @@
+<!-- Test page shaped like a Grafana panel: a canvas graph that is redrawn in requestAnimationFrame, after every new point
+     (once a second) and after every resize (setting a canvas's size clears it, as Grafana's graphs do on resize), and a
+     line saying, live, whether Chrome counts the page as visible and how many animation frames it ran in the last second.
+     Open it maximized on the screen under test. -->
+<title>graph-page</title>
+<body style="margin:0;background:#111217;color:#ccccdc;font:22px sans-serif;overflow:hidden">
+<div id=info style="padding:10px 16px"></div>
+<div id=panel style="position:absolute;left:16px;right:16px;top:60px;bottom:16px;background:#181b1f;border:1px solid #2c3235">
+  <canvas id=c style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas>
+</div>
+<script>
+const c = document.getElementById('c'), panel = document.getElementById('panel'), info = document.getElementById('info');
+const pts = []; let frames = 0, fps = 0, resizes = 0, drawn = 0, pending = false;
+function draw() {
+  pending = false; drawn++;
+  const g = c.getContext('2d'), w = c.width, h = c.height;
+  g.clearRect(0, 0, w, h);
+  g.strokeStyle = '#2c3235'; g.lineWidth = 1;
+  for (let y = 0; y <= 4; y++) { g.beginPath(); g.moveTo(0, y * h / 4); g.lineTo(w, y * h / 4); g.stroke(); }
+  g.strokeStyle = '#73bf69'; g.lineWidth = 3; g.beginPath();
+  pts.forEach((v, i) => { const x = w - (pts.length - 1 - i) * w / 120, y = h / 2 - v * h * 0.4; i ? g.lineTo(x, y) : g.moveTo(x, y); });
+  g.stroke();
+  g.fillStyle = 'rgba(115,191,105,0.15)'; g.lineTo(w, h); g.lineTo(w - (pts.length - 1) * w / 120, h); g.fill();
+}
+function later() { if (!pending) { pending = true; requestAnimationFrame(draw); } }
+new ResizeObserver(() => { c.width = panel.clientWidth; c.height = panel.clientHeight; resizes++; later(); }).observe(panel);
+(function count() { frames++; requestAnimationFrame(count); })();
+setInterval(() => {
+  const t = Date.now() / 1000; pts.push(Math.sin(t / 3) * 0.8 + Math.sin(t * 1.7) * 0.2); if (pts.length > 121) pts.shift();
+  fps = frames; frames = 0; later();
+  info.textContent = new Date().toLocaleTimeString() + ' | ' + document.visibilityState + ' | ' + fps + ' animation frames/s | graph drawn ' + drawn + ' times | ' + innerWidth + 'x' + innerHeight + ', resized ' + resizes;
+}, 1000);
+</script>

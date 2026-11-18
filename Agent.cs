@@ -24,6 +24,8 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
 using Windows.Devices.Display;
 using Windows.Devices.Display.Core;
 using Windows.Graphics;
@@ -264,6 +266,41 @@ public static class Pix {
         if (put > 0) Agent.Log("put " + put + " window(s) back on " + s.Device);
     }
     internal static void Place(Win w) { w.place.length = Marshal.SizeOf(typeof(PLACEMENT)); if (!GetWindowPlacement(w.H, ref w.place)) w.place.length = 0; }
+
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("advapi32.dll")] static extern int RegQueryInfoKey(SafeRegistryHandle key, IntPtr c, IntPtr cl, IntPtr r, IntPtr sk, IntPtr skl, IntPtr cll, IntPtr v, IntPtr vnl, IntPtr vl, IntPtr sd, out long lastWrite);
+    // Chrome and Edge take their setting "keep drawing while the PC is locked" (policy WindowOcclusionEnabled = 0, made
+    // by the setup) only when they start. Measured on Windows 10: set while Chrome ran, Chrome froze at the next lock, its
+    // page dark (3 pictures in a minute; a user saw it as a black graph); restarted, it drew on. Said once per lock for
+    // such a browser on the kept screen, as a hint: one that started while an earlier setup's setting was in place
+    // draws fine although the setting was written again since (measured), and from outside the two look the same.
+    public static void BrowserHint(Snap s) {
+        string[][] browsers = { new[] { "chrome", @"SOFTWARE\Policies\Google\Chrome", "Chrome", "chrome://restart" }, new[] { "msedge", @"SOFTWARE\Policies\Microsoft\Edge", "Edge", "edge://restart" } };
+        foreach (string[] b in browsers) {
+            DateTime set = PolicySince(b[1]);
+            if (set == DateTime.MinValue) continue;
+            foreach (Win w in s.Wins) {
+                uint pid; GetWindowThreadProcessId(w.H, out pid);
+                try {
+                    using (Process p = Process.GetProcessById((int)pid))
+                        if (string.Equals(p.ProcessName, b[0], StringComparison.OrdinalIgnoreCase) && p.StartTime < set) {
+                            Agent.Log(b[2] + " has been running since " + p.StartTime.ToString("G") + ", longer than its setting to keep drawing while the PC is locked (made " + set.ToString("G") + "): if its page is dark or frozen now, restart it once (" + b[3] + " in its address bar)");
+                            break;
+                        }
+                } catch (Exception) { }   // closed meanwhile, or a process this program may not ask about
+            }
+        }
+    }
+    // When the browser's policy WindowOcclusionEnabled = 0 was last written (its key's time); MinValue if it is not set.
+    static DateTime PolicySince(string key) {
+        using (RegistryKey hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64))
+        using (RegistryKey k = hklm.OpenSubKey(key)) {
+            long t;
+            if (k == null || !Equals(k.GetValue("WindowOcclusionEnabled"), 0)
+                || RegQueryInfoKey(k.Handle, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out t) != 0) return DateTime.MinValue;
+            return DateTime.FromFileTime(t);
+        }
+    }
     // Into its noted place without the focus (4 = SW_SHOWNOACTIVATE), then maximized there if it was (3). In two steps:
     // a window that Windows left maximized on the other screen takes no new place in one (measured on Windows 10), and
     // maximizing it from its place did not take the focus (measured). The flag 4 = WPF_ASYNCWINDOWPLACEMENT: asked without
@@ -718,6 +755,7 @@ public static class Agent {
             Pix.Snap noted = Pix.WaitForLock(!checkedOnce);
             if (noted.Check) { checkedOnce = true; Check(framesTo); Pix.PutBack(noted); continue; }
             Stopwatch locked = Stopwatch.StartNew(), since = null;
+            Pix.BrowserHint(noted);
             int fails = 0, shown = 0; bool freed = false; HashSet<string> early = new HashSet<string>();
             while (Common.Locked()) {
                 string held = Common.Taken();

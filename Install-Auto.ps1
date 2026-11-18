@@ -25,9 +25,10 @@ Enterprise, Pro for Workstations and IoT Enterprise hand a screen to a program; 
 
 Two settings are changed so that whatever is on that screen keeps drawing with nothing to configure per app. Both are
 remembered and put back by -Remove:
-  * Windows, for that user: "Minimize windows when a monitor is disconnected" off (Settings > System > Display >
+  * Windows 11, for that user: "Minimize windows when a monitor is disconnected" off (Settings > System > Display >
     Multiple displays). With it on, Windows minimizes the windows of the screen that leaves the desktop and there is
-    nothing left to show. Windows reads it at sign-in: sign out and back in once after the first setup.
+    nothing left to show. Windows reads it at sign-in: sign out and back in once after the first setup. Windows 10 has
+    no such setting and does not minimize them.
   * Chrome and Edge: their policy WindowOcclusionEnabled = 0. These browsers stop drawing windows they believe hidden,
     and they treat a locked PC that way. This policy is their own switch for that; they then say "managed by your
     organization". Restart them once. Apps built on the same engine (Electron) have no such switch and may freeze.
@@ -118,9 +119,11 @@ Reg 'LockMonitor-Agent' $agent $(if ($TestFrames) { "-frames `"$TestFrames`"" })
 Reg 'LockMonitor-Take' $helper '-take' (OnState 7) 'Highest' $short
 Reg 'LockMonitor-Give' $helper '-give' @((OnState 8), $logon) 'Highest' $short   # sign-in too: a restart while locked must not leave the screen off the desktop
 
+$os = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $changed = @()
 foreach ($s in $settings) {
     if ($s.Browser -and $LeaveBrowsers) { continue }
+    if ($s.Memo -eq 'PrevMonitorRemoval' -and [int]$os.CurrentBuild -lt 22000) { continue }   # Windows 10 has no such setting and moves the windows without minimizing them (measured on 19045)
     $now = Current $s
     if ($now -eq $s.Want) { continue }
     if ($null -eq (Mine $s.Memo)) { Set-ItemProperty $own -Name $s.Memo -Value $(if ($null -eq $now) { 'unset' } else { "$now" }) }   # remembered once, so a second setup run cannot overwrite the real old value
@@ -132,7 +135,6 @@ Start-ScheduledTask 'LockMonitor-Agent'
 
 # The live test: the helper takes the screen as it will at Win+L, the agent shows a text on it for a few seconds (it
 # does so because of the note "Check", which only administrators can leave), and the helper puts the screen back.
-$os = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 "Windows: $((Get-CimInstance Win32_OperatingSystem).Caption), edition $($os.EditionID), build $($os.CurrentBuild)"
 'Testing: the highest-numbered screen goes dark for a few seconds and shows a test picture. Its windows move away and come back.'
 Start-Sleep 1   # the agent has to be up and waiting
@@ -172,5 +174,8 @@ elseif (-not $taken -and $why -match 'nothing to keep') {
 "Set up LockMonitor $version for $User ($(if ($ready) { 'the ready-built programs' } else { 'built here from the sources' })). Logs: %LOCALAPPDATA%\LockMonitor\log.txt and $dst\switch.log. Undo: .\Install-Auto.ps1 -Remove"
 $todo = @()
 if ($changed -contains 'PrevMonitorRemoval') { $todo += 'sign out and back in once (Windows reads its "Minimize windows when a monitor is disconnected" setting, now off, only at sign-in)' }
-if ($changed -match 'Occlusion') { $todo += 'restart Chrome and Edge once (they now keep drawing while the PC is locked, and will say "managed by your organization")' }
+if ($changed -match 'Occlusion') {   # a browser that runs now takes the new setting only when it starts again (measured: until then it freezes at a lock)
+    $open = @(Get-Process chrome, msedge -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ProcessName -Unique | ForEach-Object { if ($_ -eq 'chrome') { 'Chrome (type chrome://restart in its address bar)' } else { 'Edge (edge://restart)' } })
+    if ($open) { $todo += "restart $($open -join ' and ') once: until then it stops drawing while the PC is locked. Afterwards it says ""managed by your organization""" }
+}
 if ($todo) { 'Before the first use: ' + ($todo -join '; and ') + '. After that, just press Win+L.' } else { 'Press Win+L to use it.' }
