@@ -50,7 +50,7 @@ $own = 'HKLM:\SOFTWARE\LockMonitor'
 # that user's own settings and files, reachable whichever administrator account approved the elevation
 $sid = (New-Object Security.Principal.NTAccount($User)).Translate([Security.Principal.SecurityIdentifier]).Value
 $desk = "Registry::HKEY_USERS\$sid\Control Panel\Desktop"
-$userDir = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath + '\AppData\Local\LockMonitor'   # the agent's log
+$userDir = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath + '\AppData\Local\LockMonitor'   # the agent's log: only read from here, never written or deleted
 # every setting this setup changes: where it lives, its name, the value needed, and the name its old value is remembered under
 $settings = @(
     @{ Key = $desk; Name = 'MonitorRemovalRecalcBehavior'; Want = 1; Memo = 'PrevMonitorRemoval' },
@@ -81,8 +81,11 @@ function Uninstall {
 
 if ($Remove) {
     Uninstall
-    Remove-Item $userDir -Recurse -Force -ErrorAction SilentlyContinue   # the agent's log; kept when a failed test undoes the setup, so that it can be read
+    # The agent's log is left alone. This script runs elevated, and that folder is the user's to change: an elevated
+    # delete there follows a junction the user may have put in its place, into folders the user cannot touch (measured
+    # in the test VM with version 0.2.2, which deleted it here).
     'Removed. Sign out and back in for the Windows setting, and restart Chrome and Edge, to be exactly as before.'
+    "The log stays in $userDir; delete it if you like."
     return
 }
 

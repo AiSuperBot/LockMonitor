@@ -51,7 +51,7 @@ The highest-numbered screen (`\\.\DISPLAYn`), and from then on only that very mo
 - The Windows setting "Minimize windows when a monitor is disconnected" is turned off for your account. With it on, Windows minimizes the windows of the monitor that leaves the desktop and there is nothing left to show.
 - The Chrome and Edge policy `WindowOcclusionEnabled` is set to 0. These browsers stop drawing when the PC is locked, and this policy is their own switch for that. They will then say "managed by your organization". `-LeaveBrowsers` skips this.
 
-`-Remove` puts both settings back to what they were.
+`-Remove` puts both settings back to what they were. It leaves the log in `%LOCALAPPDATA%\LockMonitor` for you to delete: the setup runs as administrator and does not delete in your own folders.
 
 ## Good to know
 
