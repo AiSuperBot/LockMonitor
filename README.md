@@ -79,7 +79,8 @@ Tested in a VMware guest (Windows 11 Enterprise LTSC 2024), with real key presse
 - the kept monitor missing at Win+L: nothing stays on
 - screens with different scaling
 - update and uninstall while it is running; the agent killed and started again at the next unlock; uninstall restores every setting
-- the setup's live test, passing and failing
+- the setup's live test, passing and failing, from the ready-built zip marked as downloaded from the internet
+- Windows refusing the request (made to happen with a deliberately wrong request): the setup shows Windows' own answer and explains it
 
 Tested on real hardware (a laptop with a TV, by the first user): the edition requirement, and the picture with version 0.1.2.
 

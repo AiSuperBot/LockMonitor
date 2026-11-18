@@ -5,7 +5,7 @@ Made to follow a screen that is unplugged while the helper holds it off the desk
 #>
 param([int]$Seconds = 120, [string]$Dir = 'C:\locktest', [string]$Agent = "$env:ProgramFiles\LockMonitor\LockMonitor-Agent.exe")
 $ErrorActionPreference = 'Stop'
-$null = [Reflection.Assembly]::LoadFile($Agent)
+$null = [Reflection.Assembly]::UnsafeLoadFrom($Agent)   # not LoadFile: an agent installed from a downloaded zip carries the "from the internet" mark, which LoadFile refuses
 $null = [Windows.Devices.Display.Core.DisplayManager, Windows.Devices.Display.Core, ContentType=WindowsRuntime]
 $Log = "$Dir\unplug-probe.log"
 for ($end = (Get-Date).AddSeconds($Seconds); (Get-Date) -lt $end; Start-Sleep 2) {

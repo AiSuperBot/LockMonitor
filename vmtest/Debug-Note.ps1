@@ -4,7 +4,7 @@ redraw it once into a PNG, and say how many windows were drawn. Uses the install
 #>
 param([string]$Out = 'C:\locktest\note.png', [string]$Agent = "$env:ProgramFiles\LockMonitor\LockMonitor-Agent.exe")
 $ErrorActionPreference = 'Stop'
-$null = [Reflection.Assembly]::LoadFile($Agent)
+$null = [Reflection.Assembly]::UnsafeLoadFrom($Agent)   # not LoadFile: an agent installed from a downloaded zip carries the "from the internet" mark, which LoadFile refuses
 [Pix]::DpiAware()
 $s = [Pix]::Snapshot()
 if (-not $s) { 'Snapshot: null (single screen)'; return }
