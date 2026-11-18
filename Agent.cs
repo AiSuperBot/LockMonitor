@@ -726,8 +726,18 @@ public static class Agent {
         ShowWindow(f.Handle, 4);   // shown without taking the focus
         return f;
     }
-    static void Settle() { Forms.Application.DoEvents(); Thread.Sleep(400); Forms.Application.DoEvents(); }
     static Pix.Win Noted(Forms.Form f, int x, int y, Rectangle v) { Pix.Win w = new Pix.Win(); w.H = f.Handle; w.X = x; w.Y = y; w.W = v.Width; w.Hgt = v.Height; return w; }
+    // Windows needs a moment before a newly shown window has a picture: until then it is captured black, for more than
+    // 0.4 s right after other windows were closed (measured). Wait until its centre is no longer black, at most 3 s.
+    static void Settle(Forms.Form f) {
+        for (int i = 0; i < 30; i++) {
+            Forms.Application.DoEvents(); Thread.Sleep(100);
+            Rectangle v = Pix.Visible(f.Handle);
+            Pix.Snap s = new Pix.Snap(); s.W = v.Width; s.H = v.Height; s.Wins.Add(Noted(f, 0, 0, v));
+            using (Frame t = new Frame(v.Width, v.Height))
+                if (Pix.CaptureWindows(s, t) == 1 && (t.Gdi.GetPixel(v.Width / 2, v.Height / 2).ToArgb() & 0xFFFFFF) != 0) return;
+        }
+    }
 
     static int SelfTest() {
         Console.WriteLine("LockMonitor " + Version + " self-test. Nothing is changed.");
@@ -767,7 +777,7 @@ public static class Agent {
         // the picture path, against windows of our own in known colours
         using (Forms.Form a = TestWindow(60, 60, 320, 200, Orange, true), b = TestWindow(120, 100, 120, 90, Blue, true))
         using (Frame shot = new Frame(640, 400)) {
-            Settle();
+            Settle(a); Settle(b);
             Rectangle va = Pix.Visible(a.Handle);
             Pix.Snap note = new Pix.Snap(); note.W = 640; note.H = 400;
             Pix.Win wa = Noted(a, 100, 50, va); note.Wins.Add(wa);
@@ -795,7 +805,7 @@ public static class Agent {
             Line("a closed window is left out", Pix.CaptureWindows(note, shot) == 0, "");
         }
         using (Forms.Form c = TestWindow(0, 0, 640, 400, Green, false)) {   // borderless, like a full-screen browser
-            Settle();
+            Settle(c);
             Rectangle vc = Pix.Visible(c.Handle);
             using (Frame shot = new Frame(vc.Width, vc.Height)) {
                 Pix.Snap note = new Pix.Snap(); note.W = vc.Width; note.H = vc.Height; note.Wins.Add(Noted(c, 0, 0, vc));
