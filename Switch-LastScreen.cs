@@ -118,7 +118,7 @@ static class SwitchLastScreen {
             return;
         }
         int rc = Set(lo, hi, id, true);
-        if (rc != 0) { Log("take: Windows refused " + device + ", error " + rc); return; }
+        if (rc != 0) { Log("take: Windows refused " + device + ", error " + rc + " (" + Common.Describe(lo, hi, id) + ")"); return; }   // its own answer for that monitor says why
         k.SetValue("Taken", lo + "|" + hi + "|" + id + "|" + device + "|" + path);   // the routine case is not logged here: the agent's log has it
         if (keep == null) k.SetValue("Keep", path);
         // Unlocked again while this ran? The unlock event's -give waits for this run to finish, so it would put the
