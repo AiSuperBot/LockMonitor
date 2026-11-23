@@ -120,7 +120,9 @@ public static class Session {
     static uint Power(IntPtr context, uint type, IntPtr setting) {
         if (type == 4 || type == 0x12) {   // PBT_APMSUSPEND: about to sleep; PBT_APMRESUMEAUTOMATIC: woke up
             asleep = type == 4; Interlocked.Increment(ref naps);
-            if (!asleep) Interlocked.Exchange(ref lockedAt, Stopwatch.GetTimestamp());   // a wake-up may pass through the sign-in desktop as a lock does (found in review)
+            // a wake-up may pass through the sign-in desktop as a lock does, and nobody need be there: as at a lock, a sign-in
+            // counts only once the lock screen's own picture was up again (found in reviews)
+            if (!asleep) { Interlocked.Exchange(ref lockedAt, Stopwatch.GetTimestamp()); curtain = false; }
             changed.Set();
             if (asleep) Free.WaitOne(1500);   // Windows allows about 2 s for this answer
         }
