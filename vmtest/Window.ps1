@@ -9,7 +9,8 @@ Test-VM helper (logged-on session): one window, found by part of its title.
                                            when its screen leaves the desktop and returns.
 #>
 #  .\Window.ps1 -Title x -Hide -After 10   hide it after 10 s, as an app may do (start it before a lock: commands cannot be started while locked)
-param([Parameter(Mandatory)][string]$Title, [switch]$Maximize, [switch]$Restore, [switch]$Hide, [int]$After, [int]$Watch, [string]$Log = 'C:\locktest\window.log', [int]$Left = [int]::MinValue, [int]$Top = 0)
+#  .\Window.ps1 -Title x -Minimize -After 10   minimize it after 10 s, as Windows 11 does when its screen leaves (setting not yet in effect)
+param([Parameter(Mandatory)][string]$Title, [switch]$Maximize, [switch]$Restore, [switch]$Hide, [switch]$Minimize, [int]$After, [int]$Watch, [string]$Log = 'C:\locktest\window.log', [int]$Left = [int]::MinValue, [int]$Top = 0)
 Add-Type @'
 using System; using System.Runtime.InteropServices; using System.Text;
 public static class Wnd {
@@ -48,6 +49,7 @@ if ($Left -ne [int]::MinValue) { $null = [Wnd]::Move($h, $Left, $Top); Start-Sle
 if ($Maximize) { $null = [Wnd]::Show($h, 3) }   # SW_MAXIMIZE
 if ($Restore) { $null = [Wnd]::Show($h, 9) }    # SW_RESTORE
 if ($Hide) { $null = [Wnd]::Show($h, 0); Add-Content $Log ('{0:HH:mm:ss.ff} hid it' -f (Get-Date)) }   # SW_HIDE
+if ($Minimize) { $null = [Wnd]::Show($h, 7); Add-Content $Log ('{0:HH:mm:ss.ff} minimized it' -f (Get-Date)) }   # SW_SHOWMINNOACTIVE
 $prev = ''
 for ($end = (Get-Date).AddSeconds($Watch); (Get-Date) -lt $end; Start-Sleep -Milliseconds 250) {
     $row = [Wnd]::State($h)

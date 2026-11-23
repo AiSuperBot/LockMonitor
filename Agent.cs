@@ -146,8 +146,10 @@ public static class Session {
             IntPtr d = OpenInputDesktop(0, false, 0x0001);   // DESKTOP_READOBJECTS
             if (d == IntPtr.Zero) Interlocked.Exchange(ref signing, now); else CloseDesktop(d);
         }
-        return now - Interlocked.Read(ref signing) < 2 * Stopwatch.Frequency;
+        return NearUnlock;
     }
+    // the same as last said, without asking Windows: true from the unlock announcement on, also amid a picture
+    public static bool NearUnlock { get { return Stopwatch.GetTimestamp() - Interlocked.Read(ref signing) < 2 * Stopwatch.Frequency; } }
     public static int Naps { get { return Thread.VolatileRead(ref naps); } }
     // between "about to sleep" and "woke up" (or the next unlock, should the wake-up go unsaid)
     public static bool Asleep { get { return asleep; } }
@@ -164,7 +166,7 @@ public static class Pwr {   // ES_CONTINUOUS 0x80000000 | ES_SYSTEM_REQUIRED 1 |
 
 // One picture, kept as a plain Windows bitmap (DIB section): window pictures are copied into it by Windows' own bitmap
 // routines and the GPU reads it from there, with no conversions in between. Gdi is a System.Drawing view of the same
-// memory, for text.
+// memory, for text; made when first asked for, as it loads GDI+, which the windows' pictures do not need.
 public class Frame : IDisposable {
     [StructLayout(LayoutKind.Sequential)] struct BITMAPINFOHEADER { public int size, width, height; public short planes, bitCount; public int compression, sizeImage, xppm, yppm, clrUsed, clrImportant; }
     [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFOHEADER bmi, uint usage, out IntPtr bits, IntPtr section, uint offset);
@@ -174,13 +176,10 @@ public class Frame : IDisposable {
     [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
     [DllImport("gdi32.dll")] static extern bool PatBlt(IntPtr dc, int x, int y, int w, int h, uint rop);
     [DllImport("gdi32.dll")] static extern bool GdiFlush();
-    [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl)] static extern int memcmp(IntPtr a, IntPtr b, UIntPtr n);
-    [DllImport("kernel32.dll", EntryPoint = "RtlMoveMemory")] static extern void CopyMemory(IntPtr dst, IntPtr src, UIntPtr n);
 
     public readonly int W, H, Stride;
     public readonly IntPtr Bits, Dc;
-    public readonly Bitmap Gdi;
-    IntPtr dib, old, last; bool gone;
+    IntPtr dib, old; Bitmap gdi; ulong[] sums; bool gone;
 
     public Frame(int w, int h) {
         W = w; H = h; Stride = w * 4;
@@ -188,33 +187,51 @@ public class Frame : IDisposable {
         dib = CreateDIBSection(IntPtr.Zero, ref bi, 0, out Bits, IntPtr.Zero, 0);
         if (dib == IntPtr.Zero) throw new OutOfMemoryException("no memory for a " + w + "x" + h + " picture");
         Dc = CreateCompatibleDC(IntPtr.Zero); old = SelectObject(Dc, dib);
-        Gdi = new Bitmap(w, h, Stride, PixelFormat.Format32bppRgb, Bits);
     }
+    public Bitmap Gdi { get { return gdi ?? (gdi = new Bitmap(W, H, Stride, PixelFormat.Format32bppRgb, Bits)); } }
     public void Clear() { PatBlt(Dc, 0, 0, W, H, 0x42); }   // 0x42 = BLACKNESS
 
     // The rows that differ from the picture at the previous call, as [top, bottom); false when none do (the first call
-    // reports all rows). The unchanged rows are found row by row from both ends; only the rows between are kept for the
-    // next comparison, and only they need to go to the GPU. Measured, 1920x1080: 0.9 ms when nothing changed, at most
-    // 1.4 ms otherwise (one native call costs 17 ns); copying the whole picture would cost 0.8 ms on top.
-    public bool Changed(out int top, out int bottom) {
+    // reports all rows); only these rows need to go to the GPU. Each row is known by a fingerprint of its pixels, 8 bytes
+    // instead of a copy of the row (a copy of the whole picture: 8 MB at 1920x1080, 32 MB at 3840x2160). Measured,
+    // 1920x1080, Intel UHD 630 PC: 0.75 ms a picture whatever changed (comparing with a copy: 0.70 ms when nothing
+    // changed, 0.77 for a band of rows, 0.44 when all rows did); the windows' pictures take 10 to 50 ms.
+    public unsafe bool Changed(out int top, out int bottom) {
         GdiFlush();   // Windows may still be holding drawing back; the memory is read directly below
-        top = 0; bottom = H;
-        if (last == IntPtr.Zero) last = Marshal.AllocHGlobal((IntPtr)((long)Stride * H));
-        else {
-            while (top < H && Same(top)) top++;
-            if (top == H) return false;
-            while (Same(bottom - 1)) bottom--;   // stops at row top at the latest, which differs
+        bool all = sums == null;
+        if (all) sums = new ulong[H];
+        top = H; bottom = 0;
+        byte* row = (byte*)Bits;
+        for (int y = 0; y < H; y++, row += Stride) {
+            ulong s = Sum(row, Stride);
+            if (all || s != sums[y]) { sums[y] = s; if (top == H) top = y; bottom = y + 1; }
         }
-        CopyMemory(last + top * Stride, Bits + top * Stride, (UIntPtr)(ulong)((long)(bottom - top) * Stride));
-        return true;
+        return top < bottom;
     }
-    bool Same(int row) { return memcmp(Bits + row * Stride, last + row * Stride, (UIntPtr)(uint)Stride) == 0; }
+    // A fingerprint of n bytes (n a multiple of 4): eight chains of x = turned(x ^ the next 8 bytes) * an odd number, side
+    // by side so that the processor works on them at once (four were twice as slow, measured). Every step can be undone,
+    // so a change of any single 8-byte piece always changes the fingerprint. The half turn carries changes of high bits
+    // into the low ones, which a multiplication alone never does (without it, two changes of a top bit in one chain
+    // cancelled out, found in review), so that several changes cancel out with a chance of about 1 in 2^64.
+    static unsafe ulong Sum(byte* p, int n) {
+        const ulong K = 0x9E3779B97F4A7C15;
+        ulong* q = (ulong*)p; int words = n >> 3, i = 0;
+        ulong a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, g = 7, h = 8;
+        for (; i + 8 <= words; i += 8) {
+            a ^= q[i]; b ^= q[i + 1]; c ^= q[i + 2]; d ^= q[i + 3]; e ^= q[i + 4]; f ^= q[i + 5]; g ^= q[i + 6]; h ^= q[i + 7];
+            a = (a << 32 | a >> 32) * K; b = (b << 32 | b >> 32) * K; c = (c << 32 | c >> 32) * K; d = (d << 32 | d >> 32) * K;
+            e = (e << 32 | e >> 32) * K; f = (f << 32 | f >> 32) * K; g = (g << 32 | g >> 32) * K; h = (h << 32 | h >> 32) * K;
+        }
+        for (; i < words; i++) { a ^= q[i]; a = (a << 32 | a >> 32) * K; }
+        if ((n & 4) != 0) { b ^= *(uint*)(p + n - 4); b = (b << 32 | b >> 32) * K; }
+        a ^= e; b ^= f; c ^= g; d ^= h;   // a change in one chain still changes the result: the others stay as they were
+        return a ^ (b << 16 | b >> 48) ^ (c << 32 | c >> 32) ^ (d << 48 | d >> 16);
+    }
 
     public void Dispose() {
         if (gone) return; gone = true;
-        Gdi.Dispose();
+        if (gdi != null) gdi.Dispose();
         SelectObject(Dc, old); DeleteDC(Dc); DeleteObject(dib);
-        if (last != IntPtr.Zero) Marshal.FreeHGlobal(last);
     }
 }
 
@@ -228,7 +245,7 @@ public static class Pix {
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong(IntPtr h, int index);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] internal static extern int GetWindowLong(IntPtr h, int index);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
@@ -240,6 +257,7 @@ public static class Pix {
     [DllImport("user32.dll")] static extern bool GetWindowPlacement(IntPtr h, ref PLACEMENT p);
     [DllImport("user32.dll")] static extern bool SetWindowPlacement(IntPtr h, ref PLACEMENT p);
     [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
@@ -286,12 +304,11 @@ public static class Pix {
     public class Win {
         public IntPtr H; public int X, Y, W, Hgt, Asked; public string Title;
         internal PLACEMENT place;
-        internal RECT whole, seen; internal int bx, by, bw, bh; internal bool live; internal long askedAt;
+        internal RECT whole, seen; internal int bx, by, bw, bh; internal bool live, minimized, done; internal long askedAt;
         // drawn pixel for pixel: its visible part is exactly the size of its place in the picture
         internal bool Exact { get { return seen.r - seen.l == bw && seen.b - seen.t == bh; } }
-        // its visible part has the noted size (as of the last Outline), on a screen: one left out of sight (see Away) when
-        // the PC was locked again before its screen was back would not draw there
-        internal bool Fits { get { return seen.r - seen.l == W && seen.b - seen.t == Hgt && MonitorFromWindow(H, 0) != IntPtr.Zero; } }
+        // its visible part has the noted size (as of the last Outline)
+        internal bool Sized { get { return seen.r - seen.l == W && seen.b - seen.t == Hgt; } }
         // drawn exactly over all of o's place, so o's picture would not show
         internal bool Covers(Win o) { return live && Exact && bx <= o.bx && by <= o.by && bx + bw >= o.bx + o.bw && by + bh >= o.by + o.bh; }
     }
@@ -360,8 +377,9 @@ public static class Pix {
     // sign-in screen went without an unlock) is no such ask: it is never given up.
     static readonly long Half = Stopwatch.Frequency / 2;
     static void Arrange(Win w, Snap s, bool hide) {
-        bool lost = MonitorFromWindow(w.H, 0) == IntPtr.Zero;   // on no screen
-        if (hide ? lost : w.Fits) return;
+        // on no screen: out of sight, or left so when the PC was locked again before its screen was back (it would not draw)
+        bool lost = MonitorFromWindow(w.H, 0) == IntPtr.Zero;
+        if (hide ? lost : (!lost && w.Sized) || Session.NearUnlock) return;   // not called back amid the unlock: Away just sent it off
         long now = Stopwatch.GetTimestamp();
         if ((!hide && !lost && w.Asked >= 3) || now - w.askedAt < Half) return;
         w.askedAt = now;
@@ -410,32 +428,42 @@ public static class Pix {
     // (measured), Windows 11 puts windows back meanwhile, and Windows gives the focus back to the window that had it
     // (measured: maximized at once, the window took the focus). When the screen does not return within 10 s (unplugged,
     // switched off: the helper's own retries take as long), a window still out of sight would be on no screen: put back
-    // the same way, Windows moves it onto one (SetWindowPlacement does that for a place that is off every screen). Gives
-    // up when the PC is locked again.
+    // the same way, Windows moves it onto one (SetWindowPlacement does that for a place that is off every screen). A
+    // window Windows minimized when its screen left (Windows 11 until the sign-out the setup asks for: found in review)
+    // comes back too; one minimized after the unlock stays so. Gives up when the PC is locked again.
     public static void PutBack(Snap s) {
         if (s.Device == null || s.Wins.Count == 0) return;
+        foreach (Win w in s.Wins) { w.minimized = IsIconic(w.H); w.done = false; }   // before the user can minimize anything
         bool back = false;
         for (int i = 0; i < 100 && !back; i++) {   // on the desktop again: the helper's note goes a second later (measured)
             if (Session.Locked()) return;
             foreach (KeyValuePair<IntPtr, MONITORINFOEX> m in Monitors()) back |= m.Value.device == s.Device;
             if (!back) Thread.Sleep(100);
         }
-        if (back) { Home(s); Thread.Sleep(1500); }   // into their place at once; maximized again once the desktop has settled
-        if (Session.Locked()) return;
-        int put = 0;
-        foreach (Win w in s.Wins) {
-            if (!IsWindowVisible(w.H)) continue;   // hidden by its app meanwhile: left so
-            if (IsIconic(w.H)) {   // minimized meanwhile (Win+D right after the unlock, say): so it stays, but un-minimized it returns to its noted place, not out of sight
-                PLACEMENT p = w.place; p.flags = 4 | (p.showCmd == 3 ? 2 : 0); p.showCmd = 7;   // 2 = WPF_RESTORETOMAXIMIZED, 7 = SW_SHOWMINNOACTIVE
-                if (p.length != 0 && SetWindowPlacement(w.H, ref p)) put++;
-                continue;
+        if (back) { Home(s); SleepWhile(() => !Session.Locked(), 1500); }   // into their place at once; maximized again once the desktop has settled
+        if (Session.Locked()) return;   // locked again meanwhile: that lock comes first
+        int put = 0, waiting = 0;
+        for (int round = 0; ; round++) {   // again every half second, up to 10 s, while a window waits for its app to leave the front (see MayMaximize)
+            waiting = 0;
+            foreach (Win w in s.Wins) {
+                if (w.done || !IsWindowVisible(w.H)) continue;   // done, or hidden by its app meanwhile: left so
+                bool iconic = IsIconic(w.H);
+                if (iconic && !w.minimized) {   // minimized after the unlock (Win+D, say): so it stays, but un-minimized it returns to its noted place, not out of sight
+                    PLACEMENT p = w.place; p.flags = 4 | (p.showCmd == 3 ? 2 : 0); p.showCmd = 7;   // 2 = WPF_RESTORETOMAXIMIZED, 7 = SW_SHOWMINNOACTIVE
+                    if (p.length != 0 && SetWindowPlacement(w.H, ref p)) put++;
+                    w.done = true; continue;
+                }
+                IntPtr on = MonitorFromWindow(w.H, 0);   // 0 = none when it is on no screen
+                MONITORINFOEX mi; bool here = !iconic && back && on != IntPtr.Zero && Info(on, out mi) && mi.device == s.Device;
+                if (!iconic && !(back ? !here || (w.place.showCmd == 3 && !IsZoomed(w.H)) : on == IntPtr.Zero)) continue;
+                if (Restore(w, here)) { w.done = true; put++; }
+                else if (w.place.showCmd == 3 && !MayMaximize(w.H)) waiting++;
             }
-            IntPtr on = MonitorFromWindow(w.H, 0);   // 0 = none when it is on no screen
-            MONITORINFOEX mi; bool here = back && on != IntPtr.Zero && Info(on, out mi) && mi.device == s.Device;
-            if ((back ? !here || (w.place.showCmd == 3 && !IsZoomed(w.H)) : on == IntPtr.Zero) && Restore(w, here)) put++;
+            if (waiting == 0 || round == 20 || !SleepWhile(() => !Session.Locked(), 500)) break;
         }
         if (back) Restack(s);
         if (put > 0) Agent.Log(back ? "put " + put + " window(s) back on " + s.Device : s.Device + " did not return: " + put + " of its window(s) moved onto another screen");
+        if (waiting > 0) Agent.Log(waiting + " window(s) on " + s.Device + " left un-maximized, in their place: maximizing them would have taken the keyboard focus from their own app, which was in front");
     }
     // Maximizing a window brings it to the top (measured: a small window on a maximized browser was behind it then; Windows
     // 11 maximizes them too), so the noted windows are stacked as they were again, each right below the one above it;
@@ -503,24 +531,36 @@ public static class Pix {
         }
     }
     // Into its noted place without the focus (4 = SW_SHOWNOACTIVATE), then maximized there if it was (3). In two steps:
-    // a window that Windows left maximized on another screen takes no new place in one (measured on Windows 10), and
-    // maximizing it from its place did not take the focus (measured). A window that is in its place already (here) is
-    // maximized where it is instead, and given its noted un-maximized place after that, which a maximized window keeps
-    // for later: it does not show its smaller size on the way (measured: it did, for a quarter of a second). The flag
-    // 4 = WPF_ASYNCWINDOWPLACEMENT: asked without waiting, so a window that does not answer cannot hold this program up.
+    // a window that Windows left maximized on another screen takes no new place in one (measured on Windows 10). A window
+    // that is in its place already (here) is maximized where it is instead, and given its noted un-maximized place after
+    // that, which a maximized window keeps for later: it does not show its smaller size on the way (measured: it did, for
+    // a quarter of a second). Not maximized while MayMaximize says no: false then, the window waiting in its place (here)
+    // or put there un-maximized. The flag 4 = WPF_ASYNCWINDOWPLACEMENT: asked without waiting, so a window that does not
+    // answer cannot hold this program up.
     internal static bool Restore(Win w, bool here) {
         if (w.place.length == 0) return false;
+        bool max = w.place.showCmd == 3, may = !max || MayMaximize(w.H);
         PLACEMENT p = w.place, now = new PLACEMENT(); p.flags = 4; now.length = p.length;
-        if (here && p.showCmd == 3 && GetWindowPlacement(w.H, ref now)) {
+        if (here && max) {
+            if (!may || !GetWindowPlacement(w.H, ref now)) return false;
             now.flags = 4; now.showCmd = 3;
             if (!SetWindowPlacement(w.H, ref now)) return false;
             p.showCmd = 8;   // SW_SHOWNA: left as it is (maximized), not activated
             return SetWindowPlacement(w.H, ref p);
         }
         p.showCmd = 4;
-        if (!SetWindowPlacement(w.H, ref p)) return false;
-        p.showCmd = w.place.showCmd;
-        return p.showCmd != 3 || SetWindowPlacement(w.H, ref p);
+        if (!SetWindowPlacement(w.H, ref p) || !may) return false;
+        if (!max) return true;
+        p.showCmd = 3;
+        return SetWindowPlacement(w.H, ref p);
+    }
+    // Maximizing activates a window (SW_SHOWMAXIMIZED). Windows lets that through, and the keyboard focus with it, when the
+    // window in front belongs to the same thread (an app with windows on both screens, in front at the unlock: found in
+    // review), or when no window is in front; else the focus stays where it is (measured: maximized 1.5 s after the
+    // unlock, the window did not take it). One that has the focus already may be maximized.
+    static bool MayMaximize(IntPtr h) {
+        IntPtr fg = GetForegroundWindow(); uint pid;
+        return fg == h || (fg != IntPtr.Zero && GetWindowThreadProcessId(fg, out pid) != GetWindowThreadProcessId(h, out pid));
     }
 
     static Frame scratch;
@@ -614,10 +654,8 @@ public static class Pix {
     // would stay unused until the next unlock). Once it is connected again, ask Windows to run the give-back task.
     // true when asked.
     static bool AskToGiveBack(string held) {
-        try {
-            uint lo, id; int hi; Common.Address(held, out lo, out hi, out id);   // where the screen is now, also after a restart
-            return Common.OffDesktop(lo, hi, id) == true && Agent.RunTask("LockMonitor-Give");
-        } catch (Exception) { return false; }   // a note this program cannot read: the next unlock puts the screen back
+        try { return Common.OffDesktop(held) == true && Agent.RunTask("LockMonitor-Give"); }   // where the screen is now, also after a restart
+        catch (Exception) { return false; }   // a note this program cannot read: the next unlock puts the screen back
     }
     // The newest note may have been made while the lock was already starting: go on from the one known to be good.
     // And do not sit on a screen-sized bitmap until the next lock.
@@ -1010,7 +1048,7 @@ public static class Agent {
                     // at the unlock the windows go out of sight until their screen is back, unless it is no longer
                     // connected: it will not come back then, and they stay where they are
                     string note = held;
-                    Session.Unlocking = () => { uint lo, id; int hi; Common.Address(note, out lo, out hi, out id); if (Common.OffDesktop(lo, hi, id) != null) Pix.Away(noted); };
+                    Session.Unlocking = () => { if (Common.OffDesktop(note) != null) Pix.Away(noted); };
                 }
                 freed = true;
                 Stopwatch ran = Stopwatch.StartNew();
@@ -1085,7 +1123,6 @@ public static class Agent {
     static string Rgb(Color c) { return c.R + "," + c.G + "," + c.B; }
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
-    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong(IntPtr h, int index);
     // x is somewhere above y in the stacking of the desktop's windows (2 = GW_HWNDNEXT: the next one down)
     static bool Above(IntPtr x, IntPtr y) { for (IntPtr h = GetWindow(x, 2); h != IntPtr.Zero; h = GetWindow(h, 2)) if (h == y) return true; return false; }
     static readonly Color Orange = Color.FromArgb(200, 100, 50), Blue = Color.FromArgb(40, 60, 200), Green = Color.FromArgb(30, 160, 60);
@@ -1207,7 +1244,7 @@ public static class Agent {
             Pix.Restack(z); Forms.Application.DoEvents();
             Line("windows are stacked as they were again", Above(b.Handle, a.Handle), "the maximized one on top before: " + raised);
             b.TopMost = true; Pix.Restack(z); Forms.Application.DoEvents();   // below an always-on-top one: it must not become one
-            Line("an ordinary window is not made always-on-top", (GetWindowLong(a.Handle, -20) & 8) == 0, "");
+            Line("an ordinary window is not made always-on-top", (Pix.GetWindowLong(a.Handle, -20) & 8) == 0, "");
             b.TopMost = false;
             a.Close(); b.Close();
             Line("a closed window is left out", Pix.CaptureWindows(note, shot) == 0, "");

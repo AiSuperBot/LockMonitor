@@ -56,7 +56,7 @@ The highest-numbered screen (`\\.\DISPLAYn`), and from then on only that very mo
 ## Good to know
 
 - **How faithful the picture is.** While the monitor is off the desktop, Windows keeps its windows on another screen, and that is where their picture comes from.
-  - Windows shrinks or un-maximizes them there, so the agent gives each window back the size it had. A maximized window is shown full size. While you sign in they are moved out of sight (classic apps stop drawing out there, so not for the whole lock), and at unlock every window goes back to where it was, maximized again if it was, without taking the focus. Nothing else is ever done to a window.
+  - Windows shrinks or un-maximizes them there, so the agent gives each window back the size it had. A maximized window is shown full size. While you sign in they are moved out of sight (classic apps stop drawing out there, so not for the whole lock), and at unlock every window goes back to where it was, maximized again if it was, without taking the focus. One exception: when the app it belongs to is in front on another screen (two Chrome windows, say), Windows would hand that window the keyboard focus on maximizing it, so it stays in its place and size, not maximized. Nothing else is ever done to a window.
   - If the other screens together are smaller than the kept one, a window cannot get its full size and its picture is enlarged to fit.
   - If the other screens use a different scaling (Settings > System > Display > Scale), apps draw their windows for that scaling and everything looks larger or smaller. The same scaling on all screens gives an identical picture. The log says so when this applies.
 - The kept monitor goes blank for a moment at Win+L, and a TV has to find its signal again.
@@ -105,7 +105,7 @@ In the source code, from a normal (not elevated) PowerShell:
 powershell -ExecutionPolicy Bypass -File .\Build.ps1
 ```
 
-This writes `bin\LockMonitor-Agent.exe` and `bin\Switch-LastScreen.exe` and prints the version, size and SHA256 of each; `-Out <folder>` writes them elsewhere. Both are optimized release builds (`/optimize+`) for any CPU, which run as 64-bit programs, without a console window and with high-entropy ASLR (`/highentropyva+`).
+This writes `bin\LockMonitor-Agent.exe` and `bin\Switch-LastScreen.exe` and prints the version, size and SHA256 of each; `-Out <folder>` writes them elsewhere. Both are optimized release builds (`/optimize+`) for any CPU, which run as 64-bit programs, without a console window and with high-entropy ASLR (`/highentropyva+`). The agent is built with `/unsafe`: it reads its own picture's memory directly to find the rows that changed.
 
 The same by hand, in a Command Prompt in the source folder:
 
@@ -114,7 +114,7 @@ set FW=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319
 set MD=%WINDIR%\System32\WinMetadata
 mkdir bin
 %FW%\csc.exe /nologo /target:winexe /optimize+ /highentropyva+ /out:bin\Switch-LastScreen.exe Switch-LastScreen.cs Common.cs
-%FW%\csc.exe /nologo /target:winexe /optimize+ /highentropyva+ /out:bin\LockMonitor-Agent.exe /r:%MD%\Windows.Devices.winmd /r:%MD%\Windows.Graphics.winmd /r:%MD%\Windows.Foundation.winmd /r:%FW%\System.Runtime.dll /r:%FW%\System.Runtime.WindowsRuntime.dll /r:%FW%\System.Runtime.InteropServices.WindowsRuntime.dll Agent.cs Common.cs
+%FW%\csc.exe /nologo /target:winexe /optimize+ /highentropyva+ /unsafe /out:bin\LockMonitor-Agent.exe /r:%MD%\Windows.Devices.winmd /r:%MD%\Windows.Graphics.winmd /r:%MD%\Windows.Foundation.winmd /r:%FW%\System.Runtime.dll /r:%FW%\System.Runtime.WindowsRuntime.dll /r:%FW%\System.Runtime.InteropServices.WindowsRuntime.dll Agent.cs Common.cs
 ```
 
 To check a build without changing anything: `bin\LockMonitor-Agent.exe -selftest | more`.

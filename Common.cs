@@ -10,8 +10,8 @@ using Microsoft.Win32;
 
 // shown in each file's Properties > Details; the agent also logs it at every start
 [assembly: AssemblyProduct("LockMonitor")]
-[assembly: AssemblyVersion("0.2.9")]
-[assembly: AssemblyFileVersion("0.2.9")]
+[assembly: AssemblyVersion("0.2.10")]
+[assembly: AssemblyFileVersion("0.2.10")]
 
 public static class Common {
     [DllImport("wtsapi32.dll")] static extern bool WTSQuerySessionInformation(IntPtr server, int session, int infoClass, out IntPtr buf, out int bytes);
@@ -113,6 +113,8 @@ public static class Common {
         if (f == null) { byte[] r = Report(lo, hi, id); if (r != null) f = (BitConverter.ToUInt32(r, 588) >> 8) & 1; }   // Windows 10
         return f == null ? (bool?)null : (f & 1) != 0;
     }
+    // the same for the screen of a "Taken" note, wherever it is now (see Address)
+    public static bool? OffDesktop(string note) { uint lo, id; int hi; Address(note, out lo, out hi, out id); return OffDesktop(lo, hi, id); }
     public static string Describe(uint lo, int hi, uint id) {
         uint? f = Specialization(lo, hi, id);
         if (f != null) return "off the desktop: " + Yes(f, 1) + "; can be handed to a program: this monitor " + Yes(f, 2) + ", this Windows " + Yes(f, 4);

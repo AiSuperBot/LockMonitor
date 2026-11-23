@@ -22,8 +22,9 @@ $md = [Environment]::GetFolderPath('System') + '\WinMetadata'
 $null = New-Item -ItemType Directory -Force $Out
 $winrt = @('Windows.Devices', 'Windows.Graphics', 'Windows.Foundation' | ForEach-Object { "/r:$md\$_.winmd" }) +
          @('System.Runtime', 'System.Runtime.WindowsRuntime', 'System.Runtime.InteropServices.WindowsRuntime' | ForEach-Object { "/r:$fw\$_.dll" })
-foreach ($b in @(@{ Src = 'Switch-LastScreen.cs'; Exe = 'Switch-LastScreen.exe'; Refs = @() }, @{ Src = 'Agent.cs'; Exe = 'LockMonitor-Agent.exe'; Refs = $winrt })) {
-    $said = & "$fw\csc.exe" /nologo /target:winexe /optimize+ /highentropyva+ "/out:$Out\$($b.Exe)" $b.Refs "$PSScriptRoot\$($b.Src)" "$PSScriptRoot\Common.cs"
+# /unsafe for the agent only: it reads its picture's memory directly (Frame.Changed)
+foreach ($b in @(@{ Src = 'Switch-LastScreen.cs'; Exe = 'Switch-LastScreen.exe'; More = @() }, @{ Src = 'Agent.cs'; Exe = 'LockMonitor-Agent.exe'; More = $winrt + '/unsafe' })) {
+    $said = & "$fw\csc.exe" /nologo /target:winexe /optimize+ /highentropyva+ "/out:$Out\$($b.Exe)" $b.More "$PSScriptRoot\$($b.Src)" "$PSScriptRoot\Common.cs"
     if ($LASTEXITCODE) { throw "Could not build $($b.Src) with $fw\csc.exe:`n$($said | Out-String)" }
     $f = Get-Item "$Out\$($b.Exe)"
     '{0}  version {1}  {2:N0} bytes  SHA256 {3}' -f $f.FullName, $f.VersionInfo.FileVersion, $f.Length, (Get-FileHash $f.FullName -Algorithm SHA256).Hash

@@ -68,10 +68,17 @@ function Stop-Agent {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like "*$dst\Show-Dashboard.ps1*-Auto*" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
+# A screen held off the desktop that was disconnected meanwhile (unplugged during a lock, say) cannot be put back now,
+# and once its note is gone nothing puts it back when it is connected again (found in review): say how to do it by hand.
+function GiveBack {
+    if ((Mine 'Taken') -and (Test-Path $helper)) { Start-Process $helper -ArgumentList '-give' -Wait }
+    $held = Mine 'Taken'
+    if ($held) { "Note: $(($held -split '\|')[3]) was disconnected while it was off the desktop and could not be put back. If it stays dark once it is connected again: Settings > System > Display > Advanced display > Remove display from desktop = Off." }
+}
 function Uninstall {
     Stop-Agent
     foreach ($t in $tasks) { Stop-ScheduledTask $t -ErrorAction SilentlyContinue; Unregister-ScheduledTask $t -Confirm:$false -ErrorAction SilentlyContinue }
-    if (Test-Path $helper) { Start-Process $helper -ArgumentList '-give' -Wait }   # never leave a screen off the desktop
+    GiveBack   # never leave a screen off the desktop
     Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
     foreach ($s in $settings) {   # each setting goes back to what it was before the setup; settings the setup never changed are left alone
         $was = Mine $s.Memo
@@ -94,6 +101,7 @@ if ($Remove) {
 }
 
 if (-not (Test-Path $own)) { $null = New-Item $own }
+GiveBack   # an update: a screen the old version still holds goes back first (the test below would forget it)
 Remove-ItemProperty $own -Name Keep -ErrorAction SilentlyContinue   # which monitor to keep is settled afresh, by the test below or the next lock
 $null = New-Item -ItemType Directory -Force $dst
 Stop-Agent   # a second run is an update: the running agent must not go on with the old files
