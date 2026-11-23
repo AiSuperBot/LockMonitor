@@ -10,8 +10,8 @@ using Microsoft.Win32;
 
 // shown in each file's Properties > Details; the agent also logs it at every start
 [assembly: AssemblyProduct("LockMonitor")]
-[assembly: AssemblyVersion("0.2.8")]
-[assembly: AssemblyFileVersion("0.2.8")]
+[assembly: AssemblyVersion("0.2.9")]
+[assembly: AssemblyFileVersion("0.2.9")]
 
 public static class Common {
     [DllImport("wtsapi32.dll")] static extern bool WTSQuerySessionInformation(IntPtr server, int session, int infoClass, out IntPtr buf, out int bytes);
@@ -59,6 +59,22 @@ public static class Common {
             if (rc != 122) break;
         }
         np = 0; return new byte[0];
+    }
+
+    // The screens of the desktop: the \\.\DISPLAYn name of each path and the target behind it (a cloned screen has
+    // several paths, so a name can come more than once).
+    public struct Screen { public string Device; public uint Lo, Id; public int Hi; }
+    public static List<Screen> Screens() {
+        uint np; byte[] paths = Paths(2, out np);
+        List<Screen> all = new List<Screen>();
+        for (int i = 0; i < np; i++) {
+            int o = 72 * i;
+            byte[] a = Ask(1, 84, BitConverter.ToUInt32(paths, o), BitConverter.ToInt32(paths, o + 4), BitConverter.ToUInt32(paths, o + 8));   // DISPLAYCONFIG_SOURCE_DEVICE_NAME: WCHAR[32] at 20
+            if (a == null) continue;
+            Screen s; s.Device = Text(a, 20, 64); s.Lo = BitConverter.ToUInt32(paths, o + 20); s.Hi = BitConverter.ToInt32(paths, o + 24); s.Id = BitConverter.ToUInt32(paths, o + 28);
+            all.Add(s);
+        }
+        return all;
     }
 
     // The monitor's own device path (DISPLAYCONFIG_TARGET_DEVICE_NAME: type 2, 420 bytes, the path at offset 164); "" if

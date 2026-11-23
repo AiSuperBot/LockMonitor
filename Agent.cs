@@ -7,7 +7,8 @@
 // The lock itself is not touched: no Windows file is patched, Win+L is not intercepted, nothing imitates the lock
 // screen. The kept screen shows pictures only: it has no pointer, no focus and takes no input. Windows are read, never
 // typed or clicked into; the only things done to them are to give them back the size they had during a lock (see
-// Pix.GiveBackSize) and to put them back in their place afterwards where Windows does not (see Pix.PutBack).
+// Pix.Arrange), to keep them out of sight while the user signs in until their screen is back (see Pix.Arrange and
+// Pix.Away), and to put them back then (see Pix.PutBack).
 //
 //   LockMonitor-Agent.exe                     the agent (no window). Log: %LOCALAPPDATA%\LockMonitor\log.txt
 //   LockMonitor-Agent.exe -selftest | more    checks this PC's graphics and window capture; changes nothing
@@ -52,6 +53,8 @@ public interface IDisplayDeviceInterop {
 // each lock and unlock (WM_WTSSESSION_CHANGE, to a message-only window on a thread of its own) keeps the flag current at
 // once. Message-only: such a window gets no broadcasts (measured: .NET's SystemEvents, whose window gets them all, made
 // the waiting agent 55% dearer). Without announcements (no window) Windows is asked every time.
+// Windows also says when the PC goes to sleep and when it wakes up: to a callback, not to a message-only window
+// (measured: the window got nothing). Each lock, unlock, sleep and wake-up ends a Wait at once.
 public static class Session {
     delegate IntPtr WndProc(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct WNDCLASS { public uint style; public WndProc proc; public int clsExtra, wndExtra; public IntPtr inst, icon, cursor, brush; public string menu, name; }
@@ -62,12 +65,26 @@ public static class Session {
     [DllImport("user32.dll")] static extern int GetMessage(out MSG m, IntPtr h, uint min, uint max);
     [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG m);
     [DllImport("wtsapi32.dll")] static extern bool WTSRegisterSessionNotification(IntPtr h, int flags);
+    [DllImport("user32.dll")] static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+    [DllImport("user32.dll")] static extern bool CloseDesktop(IntPtr h);
+    delegate uint PowerProc(IntPtr context, uint type, IntPtr setting);
+    [StructLayout(LayoutKind.Sequential)] struct SUBSCRIBE { public PowerProc proc; public IntPtr context; }   // DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS
+    [DllImport("powrprof.dll")] static extern uint PowerRegisterSuspendResumeNotification(uint flags, IntPtr recipient, out IntPtr handle);
 
     static volatile int flag = -1;   // as Common.SessionFlag: 0 locked, 1 unlocked, -1 not known
     static volatile int news;        // counts announcements: an answer asked for before the latest one is older than it
     static volatile bool told;       // announcements arrive
     static long asked;               // Stopwatch time of the last answer
-    static readonly WndProc proc = Announced;   // kept alive: Windows calls it as long as the window exists
+    static long lockedAt;            // Stopwatch time of the latest lock announcement
+    static int naps;                 // counts the moments the PC went to sleep or woke up
+    static volatile bool asleep;     // between "goes to sleep" and "woke up"
+    static readonly WndProc proc = Announced;   // kept alive: Windows calls these as long as the program runs
+    static readonly PowerProc power = Power;
+    static readonly AutoResetEvent changed = new AutoResetEvent(false);
+    // set while this program owns no screen; the PC waits for it before it sleeps
+    public static readonly ManualResetEvent Free = new ManualResetEvent(true);
+    // run the moment the PC is unlocked, before anything else (see Pix.Home)
+    public static volatile Action Unlocking;
 
     static Session() {
         Thread t = new Thread(() => {
@@ -79,13 +96,33 @@ public static class Session {
             MSG m; while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) DispatchMessage(ref m);
         });
         t.IsBackground = true; t.Start();
+        SUBSCRIBE s = new SUBSCRIBE(); s.proc = power;
+        IntPtr p = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SUBSCRIBE)));   // never freed: Windows may read it as long as the program runs
+        Marshal.StructureToPtr(s, p, false);
+        IntPtr reg; PowerRegisterSuspendResumeNotification(2, p, out reg);   // 2 = DEVICE_NOTIFY_CALLBACK
     }
     static IntPtr Announced(IntPtr h, uint msg, IntPtr w, IntPtr l) {
         if (msg == 0x2B1) {   // WM_WTSSESSION_CHANGE: 7 = locked, 8 = unlocked; anything else (sign-out, remote connect...): ask Windows
             int what = w.ToInt32();
+            Action a = Unlocking;
+            // a picture taken meanwhile treats the windows as during the sign-in: it would call them back otherwise
+            if (what == 8) Interlocked.Exchange(ref signing, Stopwatch.GetTimestamp());
+            if (what == 8 && a != null) try { a(); } catch (Exception) { }   // must not end this thread
+            if (what == 7) Interlocked.Exchange(ref lockedAt, Stopwatch.GetTimestamp());
+            if (what == 8) asleep = false;   // awake, whatever the power notices said (not at a lock: one comes with a sleep)
             flag = what == 7 ? 0 : what == 8 ? 1 : -1; news++; Interlocked.Exchange(ref asked, Stopwatch.GetTimestamp());
+            changed.Set();
         }
         return DefWindowProc(h, msg, w, l);
+    }
+    // Display objects from before a sleep cannot be trusted after it (the graphics adapter was switched off), so the
+    // screen is given up before the PC sleeps, and owned afresh once it woke up.
+    static uint Power(IntPtr context, uint type, IntPtr setting) {
+        if (type == 4 || type == 0x12) {   // PBT_APMSUSPEND: about to sleep; PBT_APMRESUMEAUTOMATIC: woke up
+            asleep = type == 4; Interlocked.Increment(ref naps); changed.Set();
+            if (asleep) Free.WaitOne(1500);   // Windows allows about 2 s for this answer
+        }
+        return 0;
     }
     static int Flag() {
         long now = Stopwatch.GetTimestamp();
@@ -97,6 +134,25 @@ public static class Session {
     }
     public static bool Locked() { return Flag() == 0; }
     public static bool Unlocked() { return Flag() == 1; }
+    // The sign-in screen is up, so the PC is about to be unlocked. Windows shows it on a desktop of its own, which this
+    // program may not open (measured: refused from the moment the password box appears until the unlock; the lock
+    // screen's picture before that is on the user's own desktop). And for 2 s after: at the unlock the sign-in screen
+    // goes a moment before Windows says the PC is unlocked (measured). Not in the first 3 s of a lock: the lock itself
+    // passes through that desktop (measured: for 0.7 s).
+    static long signing;   // Stopwatch time the sign-in screen was last seen, or the unlock announced
+    public static bool SigningIn() {
+        long now = Stopwatch.GetTimestamp();
+        if (now - Interlocked.Read(ref lockedAt) >= 3 * Stopwatch.Frequency) {
+            IntPtr d = OpenInputDesktop(0, false, 0x0001);   // DESKTOP_READOBJECTS
+            if (d == IntPtr.Zero) Interlocked.Exchange(ref signing, now); else CloseDesktop(d);
+        }
+        return now - Interlocked.Read(ref signing) < 2 * Stopwatch.Frequency;
+    }
+    public static int Naps { get { return Thread.VolatileRead(ref naps); } }
+    // between "about to sleep" and "woke up" (or the next unlock, should the wake-up go unsaid)
+    public static bool Asleep { get { return asleep; } }
+    // Sleeps up to ms; returns early at a lock, unlock, sleep or wake-up.
+    public static void Wait(int ms) { changed.WaitOne(ms); }
 }
 
 public static class Pwr {   // ES_CONTINUOUS 0x80000000 | ES_SYSTEM_REQUIRED 1 | ES_DISPLAY_REQUIRED 2; holds for the calling thread
@@ -184,6 +240,7 @@ public static class Pix {
     [DllImport("user32.dll")] static extern bool GetWindowPlacement(IntPtr h, ref PLACEMENT p);
     [DllImport("user32.dll")] static extern bool SetWindowPlacement(IntPtr h, ref PLACEMENT p);
     [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+    [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
     [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
     [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr hmon, int type, out uint dpiX, out uint dpiY);
@@ -218,10 +275,10 @@ public static class Pix {
     public static Rectangle Visible(IntPtr hwnd) { RECT w = new RECT(), s = new RECT(); return Outline(hwnd, ref w, ref s) ? Rectangle.FromLTRB(s.l, s.t, s.r, s.b) : Rectangle.Empty; }
 
     // What was on the screen: its windows, top-most first, in the screen's own pixels (noted while unlocked).
-    // Scale: the screen's display scaling in percent; OtherScale: that of another desktop screen when it differs, else 0.
-    // Check: not a lock but the setup's test.
+    // Left, Top: where the screen was on the desktop. Scale: the screen's display scaling in percent; OtherScale: that of
+    // another desktop screen when it differs, else 0. Check: not a lock but the setup's test.
     public class Snap {
-        public string Device; public int W, H, Scale, OtherScale; public List<Win> Wins = new List<Win>(); public bool Check;
+        public string Device; public int Left, Top, W, H, Scale, OtherScale; public List<Win> Wins = new List<Win>(); public bool Check;
         internal Win Find(IntPtr h) { foreach (Win w in Wins) if (w.H == h) return w; return null; }   // a handful of windows: a list is quicker than a table
     }
     // One window: noted place and size (and Windows' own record of it, for PutBack); and, set anew for every picture, how
@@ -229,9 +286,12 @@ public static class Pix {
     public class Win {
         public IntPtr H; public int X, Y, W, Hgt, Asked; public string Title;
         internal PLACEMENT place;
-        internal RECT whole, seen; internal int bx, by, bw, bh, unmaximized; internal bool live; internal long askedAt;
+        internal RECT whole, seen; internal int bx, by, bw, bh; internal bool live; internal long askedAt;
         // drawn pixel for pixel: its visible part is exactly the size of its place in the picture
         internal bool Exact { get { return seen.r - seen.l == bw && seen.b - seen.t == bh; } }
+        // its visible part has the noted size (as of the last Outline), on a screen: one left out of sight (see Away) when
+        // the PC was locked again before its screen was back would not draw there
+        internal bool Fits { get { return seen.r - seen.l == W && seen.b - seen.t == Hgt && MonitorFromWindow(H, 0) != IntPtr.Zero; } }
         // drawn exactly over all of o's place, so o's picture would not show
         internal bool Covers(Win o) { return live && Exact && bx <= o.bx && by <= o.by && bx + bw >= o.bx + o.bw && by + bh >= o.by + o.bh; }
     }
@@ -267,7 +327,7 @@ public static class Pix {
             int n = Common.Number(m.Value.device); if (n > bestN) { bestN = n; best = m.Key; bm = m.Value; }
         }
         if (best == IntPtr.Zero) return null;
-        Snap s = new Snap(); s.Device = bm.device; s.W = bm.mon.r - bm.mon.l; s.H = bm.mon.b - bm.mon.t; s.Scale = scale[best];
+        Snap s = new Snap(); s.Device = bm.device; s.Left = bm.mon.l; s.Top = bm.mon.t; s.W = bm.mon.r - bm.mon.l; s.H = bm.mon.b - bm.mon.t; s.Scale = scale[best];
         foreach (int other in scale.Values) if (other != s.Scale && other != 0 && s.Scale != 0) s.OtherScale = other;
         StringBuilder text = new StringBuilder(256);
         EnumWindows((h, p) => {   // cheapest tests first: most of the hundreds of top-level windows fall out on the first line
@@ -286,55 +346,127 @@ public static class Pix {
         return s;
     }
 
-    // Windows shrinks or un-maximizes windows when it moves them to another screen (measured: a maximized browser arrived
-    // there in its smaller, restored size; enlarged to fit, it looked like a lower resolution). So a window that has
-    // another size than noted is asked to take its noted size again, in the corner of the screen it is on now (measured:
-    // a browser will not reach past the screen's edge from where Windows put it); nobody sees the desktop while the PC is
-    // locked. This is the only thing this program does to a window during a lock. It asks without waiting (0x4000), so a
-    // window that does not answer cannot hold the pictures up; at most 3 times, at least half a second apart so that a
-    // slow app has the time to answer: one that will not take the size is fitted instead. When the screen returns,
-    // Windows 11 itself puts each window back exactly as it was (measured: maximized again, and its un-maximized place and
-    // size untouched); on Windows 10, PutBack does.
+    // When the screen leaves the desktop, Windows moves its windows onto another screen, and shrinks or un-maximizes them
+    // there (measured: a maximized browser arrived in its smaller, restored size; enlarged to fit, it looked like a lower
+    // resolution). So a window that has another size than noted is asked to take its noted size again, in the corner of
+    // the screen it is on now (measured: a browser will not reach past the screen's edge from where Windows put it);
+    // nobody sees the desktop while the PC is locked. Nobody but the user who unlocks it: Windows shows the screens behind
+    // its "Welcome" before the unlock (measured: the kept screen's windows flashed there). So while the sign-in screen is
+    // up (hide), they are asked out of sight instead, beside every screen, and put into their place once their screen is
+    // back (see PutBack). Not out of sight all through the lock: there most windows stop drawing (measured on Windows 10:
+    // a classic window, and a Chrome that draws without the GPU). It asks without waiting (0x4000), so a window that does
+    // not answer cannot hold the pictures up; at least half a second apart so that a slow app has the time to answer, and
+    // for its size at most 3 times: one that will not take it is fitted instead. Calling one back from out of sight (the
+    // sign-in screen went without an unlock) is no such ask: it is never given up.
     static readonly long Half = Stopwatch.Frequency / 2;
-    static void GiveBackSize(Win w) {
+    static void Arrange(Win w, Snap s, bool hide) {
+        bool lost = MonitorFromWindow(w.H, 0) == IntPtr.Zero;   // on no screen
+        if (hide ? lost : w.Fits) return;
         long now = Stopwatch.GetTimestamp();
-        if (now - w.askedAt < Half) return;
+        if ((!hide && !lost && w.Asked >= 3) || now - w.askedAt < Half) return;
         w.askedAt = now;
-        // A window that Windows kept maximized on the other screen has that screen's size and refuses another one
-        // (measured: 1280x800 there against 1280x752 noted). It is un-maximized first, without being activated
-        // (4 = SW_SHOWNOACTIVATE), and asked for its size after that: un-maximizing is not one of the 3 asks.
-        if (IsZoomed(w.H)) { if (w.unmaximized++ < 3) ShowWindowAsync(w.H, 4); return; }
-        w.Asked++;
         MONITORINFOEX mi;
-        if (!Info(MonitorFromWindow(w.H, 2), out mi)) return;   // 2 = the nearest screen
-        // place and size include the invisible border the window has now; 4 = same stacking, 0x10 = no focus
-        SetWindowPos(w.H, IntPtr.Zero, mi.mon.l - (w.seen.l - w.whole.l), mi.mon.t - (w.seen.t - w.whole.t),
-            w.W + (w.whole.r - w.whole.l) - (w.seen.r - w.seen.l), w.Hgt + (w.whole.b - w.whole.t) - (w.seen.b - w.seen.t), 0x4000 | 0x4 | 0x10);
+        if (hide) Move(w.H, Beside(s), s.Top + w.Y, w.W, w.Hgt, w.whole, w.seen);
+        else if (Info(MonitorFromWindow(w.H, 2), out mi)) { if (!lost) w.Asked++; Move(w.H, mi.mon.l, mi.mon.t, w.W, w.Hgt, w.whole, w.seen); }   // 2 = the nearest screen
+    }
+    // right of every screen, the kept one included: still out of sight when it is back (measured: 100 px off on it, before)
+    static int Beside(Snap s) { return Math.Max(GetSystemMetrics(76) + GetSystemMetrics(78), s.Left + s.W) + 100; }   // SM_XVIRTUALSCREEN + SM_CXVIRTUALSCREEN
+    // The same while the screen is freed but not handed over yet (Windows takes half a second for that, measured): the
+    // windows have their size back by the first picture.
+    public static void Fit(Snap s, bool hide) {
+        foreach (Win w in s.Wins) if (IsWindowVisible(w.H) && !IsIconic(w.H) && Outline(w.H, ref w.whole, ref w.seen)) Arrange(w, s, hide);
+    }
+    // Asks a window, without waiting, for its visible part (seen, inside whole: Windows adds an invisible border) to be at
+    // x, y and w x hgt. A maximized window refuses another place and size (measured: Windows kept one maximized on the
+    // other screen, 1280x800 there against 1280x752 noted): it is un-maximized first, without being activated
+    // (4 = SW_SHOWNOACTIVATE), and the request queues behind that (measured: both done in one go). 4 = same stacking,
+    // 0x10 = no focus.
+    static void Move(IntPtr h, int x, int y, int w, int hgt, RECT whole, RECT seen) {
+        if (IsZoomed(h)) ShowWindowAsync(h, 4);
+        SetWindowPos(h, IntPtr.Zero, x - (seen.l - whole.l), y - (seen.t - whole.t),
+            w + (whole.r - whole.l) - (seen.r - seen.l), hgt + (whole.b - whole.t) - (seen.b - seen.t), 0x4000 | 0x4 | 0x10);
+    }
+    // At the latest the moment Windows says the PC is unlocked (measured: 16 ms before the user's desktop is back), every
+    // noted window is asked out of sight: when the sign-in screen was too short for a picture in between, say. Not
+    // straight into its place where the screen was: its invisible border reaches into the screen beside that place, and
+    // Chrome was then fitted into that screen at the unlock (measured).
+    public static void Away(Snap s) { Home(s, Beside(s)); }
+    // Every noted window into its noted place and size, or at x if given; on whatever thread hears of the unlock, so with
+    // outlines of its own: the pictures may be looking at the same windows. Into its place, one that is maximized already
+    // is left so (measured: Windows 11 had maximized it there again); PutBack sees to one maximized elsewhere.
+    public static void Home(Snap s, int x = int.MinValue) {
+        foreach (Win w in s.Wins) {
+            RECT whole = new RECT(), seen = new RECT();
+            if (IsWindowVisible(w.H) && !IsIconic(w.H) && (x != int.MinValue || !IsZoomed(w.H)) && Outline(w.H, ref whole, ref seen))
+                Move(w.H, x == int.MinValue ? s.Left + w.X : x, s.Top + w.Y, w.W, w.Hgt, whole, seen);
+        }
     }
 
-    // After the screen was held (a lock, or the setup's test): Windows 11 puts the windows of a screen that returns to the
-    // desktop back where they were; Windows 10 leaves them on the screen it moved them to (both measured, 19045 and 26100).
-    // So once the helper has put the screen back, every noted window that is still elsewhere is put back as Windows itself
-    // recorded it when it was noted: its place, maximized again if it was. Windows 11 has done it by then, so nothing
-    // moves there. Gives up when the screen does not return within 10 s (unplugged, switched off: the helper's own retries
-    // take as long) or the PC is locked again.
+    // After the screen was held (a lock, or the setup's test), once the helper has put it back: every noted window goes
+    // into its noted place at once, then every one that is not on that screen, or not maximized again although it was,
+    // is put back as Windows itself recorded it when it was noted. Windows 11 maximizes them again itself, on Windows 10
+    // this does (measured: Windows 10 leaves windows where they are when a screen returns, 19045). That second step 1.5 s
+    // after the screen is back: its return is several changes of the desktop in a row, each with new screen handles
+    // (measured), Windows 11 puts windows back meanwhile, and Windows gives the focus back to the window that had it
+    // (measured: maximized at once, the window took the focus). When the screen does not return within 10 s (unplugged,
+    // switched off: the helper's own retries take as long), a window still out of sight would be on no screen: put back
+    // the same way, Windows moves it onto one (SetWindowPlacement does that for a place that is off every screen). Gives
+    // up when the PC is locked again.
     public static void PutBack(Snap s) {
         if (s.Device == null || s.Wins.Count == 0) return;
-        IntPtr mon = IntPtr.Zero;
-        for (int i = 0; i < 40 && mon == IntPtr.Zero; i++) {
+        bool back = false;
+        for (int i = 0; i < 100 && !back; i++) {   // on the desktop again: the helper's note goes a second later (measured)
             if (Session.Locked()) return;
-            if (Common.Taken() == null) foreach (KeyValuePair<IntPtr, MONITORINFOEX> m in Monitors()) if (m.Value.device == s.Device) mon = m.Key;
-            if (mon == IntPtr.Zero) Thread.Sleep(250);
+            foreach (KeyValuePair<IntPtr, MONITORINFOEX> m in Monitors()) back |= m.Value.device == s.Device;
+            if (!back) Thread.Sleep(100);
         }
-        if (mon == IntPtr.Zero) return;
-        Thread.Sleep(1500);   // Windows 11 is busy putting them back meanwhile
+        if (back) { Home(s); Thread.Sleep(1500); }   // into their place at once; maximized again once the desktop has settled
         if (Session.Locked()) return;
         int put = 0;
-        // a window its app hid meanwhile stays hidden: putting it back would show it again
-        foreach (Win w in s.Wins) if (IsWindowVisible(w.H) && !IsIconic(w.H) && MonitorFromWindow(w.H, 0) != mon && Restore(w)) put++;
-        if (put > 0) Agent.Log("put " + put + " window(s) back on " + s.Device);
+        foreach (Win w in s.Wins) {
+            if (!IsWindowVisible(w.H)) continue;   // hidden by its app meanwhile: left so
+            if (IsIconic(w.H)) {   // minimized meanwhile (Win+D right after the unlock, say): so it stays, but un-minimized it returns to its noted place, not out of sight
+                PLACEMENT p = w.place; p.flags = 4 | (p.showCmd == 3 ? 2 : 0); p.showCmd = 7;   // 2 = WPF_RESTORETOMAXIMIZED, 7 = SW_SHOWMINNOACTIVE
+                if (p.length != 0 && SetWindowPlacement(w.H, ref p)) put++;
+                continue;
+            }
+            IntPtr on = MonitorFromWindow(w.H, 0);   // 0 = none when it is on no screen
+            MONITORINFOEX mi; bool here = back && on != IntPtr.Zero && Info(on, out mi) && mi.device == s.Device;
+            if ((back ? !here || (w.place.showCmd == 3 && !IsZoomed(w.H)) : on == IntPtr.Zero) && Restore(w, here)) put++;
+        }
+        if (back) Restack(s);
+        if (put > 0) Agent.Log(back ? "put " + put + " window(s) back on " + s.Device : s.Device + " did not return: " + put + " of its window(s) moved onto another screen");
+    }
+    // Maximizing a window brings it to the top (measured: a small window on a maximized browser was behind it then; Windows
+    // 11 maximizes them too), so the noted windows are stacked as they were again, each right below the one above it;
+    // without moving, sizing or activating any (0x4000 = without waiting, 0x10 = no focus, 2 + 1 = place and size kept).
+    // Never an ordinary window right below an always-on-top one (WS_EX_TOPMOST, 8): above the others, the taskbar among
+    // them, it would become one itself (Windows' rule); it is below them all anyway.
+    internal static void Restack(Snap s) {
+        for (int i = 1; i < s.Wins.Count; i++) {
+            IntPtr up = s.Wins[i - 1].H, h = s.Wins[i].H;
+            if (IsWindowVisible(h) && IsWindowVisible(up) && ((GetWindowLong(up, -20) & 8) == 0 || (GetWindowLong(h, -20) & 8) != 0))
+                SetWindowPos(h, up, 0, 0, 0, 0, 0x4000 | 0x10 | 0x2 | 0x1);
+        }
     }
     internal static void Place(Win w) { w.place.length = Marshal.SizeOf(typeof(PLACEMENT)); if (!GetWindowPlacement(w.H, ref w.place)) w.place.length = 0; }
+
+    // Windows this program asked out of sight and could not put back because it ended meanwhile: visible, not minimized,
+    // on no screen, their visible part exactly where Beside puts them (100 px right of all screens, once the kept one is
+    // back), and only there: a window an app keeps off the screens itself is left alone. Asked onto a screen when the
+    // program starts (SetWindowPlacement moves a window whose place is off every screen onto one). Returns how many.
+    public static int Rescue() {
+        int at = GetSystemMetrics(76) + GetSystemMetrics(78) + 100, n = 0;
+        EnumWindows((h, p) => {
+            RECT whole = new RECT(), seen = new RECT(); PLACEMENT pl = new PLACEMENT(); pl.length = Marshal.SizeOf(typeof(PLACEMENT));
+            if (IsWindowVisible(h) && !IsIconic(h) && MonitorFromWindow(h, 0) == IntPtr.Zero && Outline(h, ref whole, ref seen) && seen.l == at && GetWindowPlacement(h, ref pl)) {
+                pl.flags = 4; pl.showCmd = 4;   // without waiting, not activated
+                if (SetWindowPlacement(h, ref pl)) n++;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return n;
+    }
 
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("advapi32.dll")] static extern int RegQueryInfoKey(SafeRegistryHandle key, IntPtr c, IntPtr cl, IntPtr r, IntPtr sk, IntPtr skl, IntPtr cll, IntPtr v, IntPtr vnl, IntPtr vl, IntPtr sd, out long lastWrite);
@@ -371,12 +503,21 @@ public static class Pix {
         }
     }
     // Into its noted place without the focus (4 = SW_SHOWNOACTIVATE), then maximized there if it was (3). In two steps:
-    // a window that Windows left maximized on the other screen takes no new place in one (measured on Windows 10), and
-    // maximizing it from its place did not take the focus (measured). The flag 4 = WPF_ASYNCWINDOWPLACEMENT: asked without
-    // waiting, so a window that does not answer cannot hold this program up.
-    internal static bool Restore(Win w) {
+    // a window that Windows left maximized on another screen takes no new place in one (measured on Windows 10), and
+    // maximizing it from its place did not take the focus (measured). A window that is in its place already (here) is
+    // maximized where it is instead, and given its noted un-maximized place after that, which a maximized window keeps
+    // for later: it does not show its smaller size on the way (measured: it did, for a quarter of a second). The flag
+    // 4 = WPF_ASYNCWINDOWPLACEMENT: asked without waiting, so a window that does not answer cannot hold this program up.
+    internal static bool Restore(Win w, bool here) {
         if (w.place.length == 0) return false;
-        PLACEMENT p = w.place; p.flags = 4; p.showCmd = 4;
+        PLACEMENT p = w.place, now = new PLACEMENT(); p.flags = 4; now.length = p.length;
+        if (here && p.showCmd == 3 && GetWindowPlacement(w.H, ref now)) {
+            now.flags = 4; now.showCmd = 3;
+            if (!SetWindowPlacement(w.H, ref now)) return false;
+            p.showCmd = 8;   // SW_SHOWNA: left as it is (maximized), not activated
+            return SetWindowPlacement(w.H, ref p);
+        }
+        p.showCmd = 4;
         if (!SetWindowPlacement(w.H, ref p)) return false;
         p.showCmd = w.place.showCmd;
         return p.showCmd != 3 || SetWindowPlacement(w.H, ref p);
@@ -413,7 +554,8 @@ public static class Pix {
     // drawn. Windows moved these windows to another screen when this one left the desktop; they are drawn where they were.
     // Each window is looked at once per picture. A window completely behind another one is not captured at all (on the
     // screen it was hidden too), and a window drawn over the whole picture leaves nothing below it to draw or to clear.
-    public static int CaptureWindows(Snap s, Frame dst) {
+    // hide: the sign-in screen is up (see Arrange).
+    public static int CaptureWindows(Snap s, Frame dst, bool hide = false) {
         double k = Math.Min((double)dst.W / s.W, (double)dst.H / s.H);   // one factor for both directions: nothing gets stretched
         double ox = (dst.W - s.W * k) / 2, oy = (dst.H - s.H * k) / 2;
         int full = -1;   // the top-most window drawn over the whole picture, if there is one
@@ -423,7 +565,7 @@ public static class Pix {
             // not drawn: a window closed, minimized or hidden by its app meanwhile (a hidden one could cover those below it)
             w.live = w.bw > 0 && w.bh > 0 && IsWindowVisible(w.H) && !IsIconic(w.H) && Outline(w.H, ref w.whole, ref w.seen);
             if (!w.live) continue;
-            if (w.Asked < 3 && (w.seen.r - w.seen.l != w.W || w.seen.b - w.seen.t != w.Hgt)) GiveBackSize(w);
+            Arrange(w, s, hide);
             if (full < 0 && w.Exact && w.bx <= 0 && w.by <= 0 && w.bx + w.bw >= dst.W && w.by + w.bh >= dst.H) full = i;
         }
         if (full < 0) dst.Clear();
@@ -447,8 +589,8 @@ public static class Pix {
     }
 
     static Snap noted, latest;
-    // Sleeps while the PC is unlocked, noting every 0.7 s what is on the last screen, and returns the note when the PC
-    // gets locked: the note from one round earlier, because the newest one may already contain the lock screen.
+    // Sleeps while the PC is unlocked, noting every 0.7 s what is on the last screen, and returns the note at once when
+    // the PC gets locked: the note from one round earlier, because the newest one may already contain the lock screen.
     // Nothing is noted while the helper holds a screen off the desktop (the "last" screen would be the wrong one).
     // With mayCheck it also returns, as a note with Check set, when the setup asks for its test (see Agent.Check).
     public static Snap WaitForLock(bool mayCheck) {
@@ -458,39 +600,38 @@ public static class Pix {
             string held = Common.Taken();
             if (held == null) { kept = 0; noted = latest; latest = Snapshot(latest); }
             else if (mayCheck && Common.Note("Check") != null) {   // with the windows noted before the test took the screen, for PutBack
-                Snap c = new Snap(), n = noted ?? latest; c.Check = true; if (n != null) { c.Device = n.Device; c.Wins = n.Wins; }
+                Snap c = new Snap(), n = noted ?? latest; c.Check = true; if (n != null) { c.Device = n.Device; c.Left = n.Left; c.Top = n.Top; c.W = n.W; c.H = n.H; c.Wins = n.Wins; }
                 return c;
             }
             else if (++kept >= 8 && Session.Unlocked() && AskToGiveBack(held)) kept = -7;   // asked: allow 10 s before asking again
-            Thread.Sleep(700);
+            Session.Wait(700);
         }
         return noted ?? latest ?? new Snap();
     }
 
     // The PC has been unlocked for 5 s and the helper still holds the screen: it was unplugged or switched off at the
     // moment of unlocking, so it could not be put back, and Windows remembers "off the desktop" for it (measured: it
-    // would stay unused until the next unlock). Once it is connected again, ask Windows to run the give-back task; this
-    // program has no rights to do that itself. true when asked.
+    // would stay unused until the next unlock). Once it is connected again, ask Windows to run the give-back task.
+    // true when asked.
     static bool AskToGiveBack(string held) {
         try {
             uint lo, id; int hi; Common.Address(held, out lo, out hi, out id);   // where the screen is now, also after a restart
-            if (Common.OffDesktop(lo, hi, id) != true) return false;
-            ProcessStartInfo p = new ProcessStartInfo(Environment.SystemDirectory + @"\schtasks.exe", "/run /tn LockMonitor-Give");
-            p.UseShellExecute = false; p.CreateNoWindow = true;
-            using (Process.Start(p)) { }
-            return true;
-        } catch (Exception) { return false; }   // a note this program cannot read, or no schtasks: the next unlock puts the screen back
+            return Common.OffDesktop(lo, hi, id) == true && Agent.RunTask("LockMonitor-Give");
+        } catch (Exception) { return false; }   // a note this program cannot read: the next unlock puts the screen back
     }
     // The newest note may have been made while the lock was already starting: go on from the one known to be good.
     // And do not sit on a screen-sized bitmap until the next lock.
     public static void LockEnded() { latest = noted; if (scratch != null) { scratch.Dispose(); scratch = null; } }
 
-    // Sleeps ms, but returns false at once when go says stop: at an unlock the screen must go back without delay.
+    // Sleeps ms, but returns false as soon as go says stop: at an unlock the screen must go back without delay (an
+    // unlock, a sleep or a wake-up end the wait at once; go is looked at every 250 ms besides).
     public static bool SleepWhile(Func<bool> go, int ms) {
-        for (int left = ms; ; left -= 100) {
+        long end = Stopwatch.GetTimestamp() + ms * Stopwatch.Frequency / 1000;
+        for (;;) {
             if (!go()) return false;
+            long left = (end - Stopwatch.GetTimestamp()) * 1000 / Stopwatch.Frequency;
             if (left <= 0) return true;
-            Thread.Sleep(Math.Min(100, left));
+            Session.Wait((int)Math.Min(250, left));
         }
     }
 }
@@ -691,15 +832,17 @@ public static class Show {
 
     // Own the screen named by the helper's note (held) and keep putting pictures on it while go() says so: the noted
     // windows, redrawn live, or the text of notice if there is one. shown counts the pictures; firstLine is logged with
-    // the first of them. framesTo (test): the pictures go to PNG files in that folder and the screen is only owned.
-    // Throws NotReady when Windows is still busy with the screen, anything else when it really cannot be done.
-    public static void Pictures(string held, Pix.Snap noted, string notice, string framesTo, Func<bool> go, Func<string> firstLine, ref int shown) {
-        try { Run(held, noted, notice, framesTo, go, firstLine, ref shown); }
+    // the first of them (given the mode and adapter). framesTo (test): the pictures go to PNG files in that folder and
+    // the screen is only owned. Throws NotReady when Windows is still busy with the screen, anything else when it really
+    // cannot be done.
+    public static void Pictures(string held, Pix.Snap noted, string notice, string framesTo, Func<bool> go, Func<string, string> firstLine, ref int shown) {
+        Session.Free.Reset();
+        try { if (go()) Run(held, noted, notice, framesTo, go, firstLine, ref shown); }   // asked after the reset: a sleep announced just before it is seen
         // every display object is let go of the moment the pictures stop: the helper is waiting to put the screen back
-        finally { GC.Collect(); GC.WaitForPendingFinalizers(); }
+        finally { GC.Collect(); GC.WaitForPendingFinalizers(); Session.Free.Set(); }
     }
 
-    static void Run(string held, Pix.Snap noted, string notice, string framesTo, Func<bool> go, Func<string> firstLine, ref int shown) {
+    static void Run(string held, Pix.Snap noted, string notice, string framesTo, Func<bool> go, Func<string, string> firstLine, ref int shown) {
         uint lo, id; int hi; Common.Address(held, out lo, out hi, out id);   // where the screen is now, also after a restart
         DisplayManager dm = DisplayManager.Create(DisplayManagerOptions.None);
         Gfx gfx = null; Frame frame = null; IntPtr[] tex = new IntPtr[2];
@@ -749,7 +892,7 @@ public static class Show {
             int i = 0, still = 0, top, bottom; bool first = true, said = false;
             int[] staleTop = { 0, 0 }, staleBottom = { hgt, hgt };   // the rows each of the two surfaces still lacks: all of them at first
             while (go()) {
-                int drawn = noted != null && noted.Wins.Count > 0 ? Pix.CaptureWindows(noted, frame) : 0;
+                int drawn = noted != null && noted.Wins.Count > 0 ? Pix.CaptureWindows(noted, frame, Session.SigningIn()) : 0;
                 if (drawn == 0) {   // say why the screen is empty, on the screen itself and once in the log
                     string why = notice != null ? notice
                         : noted.Wins.Count == 0 ? "Nothing was open on this screen when the PC was locked"
@@ -775,7 +918,7 @@ public static class Show {
                     }
                     shown++;
                     if (first) {
-                        first = false; Agent.Log(firstLine() + " (" + w + "x" + hgt + (gfx == null ? ", to files" : " on " + gfx.AdapterName) + ")");
+                        first = false; Agent.Log(firstLine(w + "x" + hgt + (gfx == null ? ", to files" : " on " + gfx.AdapterName)));
                         // Measured, and nothing this program can change: while the screen is off the desktop its windows live on
                         // another screen, and each app draws its window for the scaling of the screen it is on.
                         if (noted != null && noted.OtherScale != 0 && !toldScaling) {
@@ -817,6 +960,8 @@ public static class Agent {
         using (Mutex one = new Mutex(true, @"Local\LockMonitor.Agent", out first)) {   // one agent per signed-in user
             if (!first) return 3;
             Log("LockMonitor " + Version + " started" + (framesTo == null ? "" : " in test mode: pictures go to " + framesTo));
+            int lost = Pix.Rescue();
+            if (lost > 0) Log(lost + " window(s) left out of sight at an earlier unlock moved onto a screen");
             for (;;) {
                 try { Loop(framesTo); }
                 catch (Exception e) { Log("starting over after an error: " + e.GetType().Name + ": " + e.Message); Thread.Sleep(10000); }
@@ -829,35 +974,89 @@ public static class Agent {
         for (;;) {
             Pix.Snap noted = Pix.WaitForLock(!checkedOnce);
             if (noted.Check) { checkedOnce = true; Check(framesTo); Pix.PutBack(noted); continue; }
-            Stopwatch locked = Stopwatch.StartNew(), since = null;
-            int fails = 0, shown = 0; bool freed = false;
+            // since: the lock, or the PC's latest wake-up during it; quiet: how long Windows' "not ready" goes unsaid (below)
+            Stopwatch locked = Stopwatch.StartNew(), since = Stopwatch.StartNew(), quiet = Stopwatch.StartNew();
+            int naps = Session.Naps, fails = 0, shown = 0, dozes = 0; bool freed = false, woke = false, asked = false; double freedAt = -1, look = 3;
             while (Session.Locked()) {
+                if (naps != Session.Naps) {   // the PC is about to sleep, or woke up: from the start again (Show lets go of the screen meanwhile)
+                    naps = Session.Naps; since.Restart(); fails = 0; dozes = 0; woke = true; asked = false; freedAt = -1; look = 3;
+                    foreach (Pix.Win w in noted.Wins) w.Asked = 0;   // the screens may have changed sizes meanwhile
+                }
+                // Nothing while the PC goes to sleep: at most 30 waits, counted rather than timed, should the wake-up go
+                // unsaid (measured in the VMs: the clock also counts the time asleep)
+                if (Session.Asleep && dozes++ < 30) { Session.Wait(1000); continue; }
                 string held = Common.Taken();
-                // nothing to do until the helper has freed the screen. It does so at the start of a lock or not at all (the
-                // monitor is off, say, for a whole night), so after half a minute the note is looked at once a second
-                if (held == null) { Thread.Sleep(locked.Elapsed.TotalSeconds < 30 ? 250 : 1000); continue; }
-                freed = true; if (since == null) since = Stopwatch.StartNew();
+                if (held == null) {
+                    // The helper frees the screen within a second of a lock. Not so 3 s after a lock or a wake-up, although
+                    // the screen is on the desktop (the lock came with a sleep, say, and the helper ran before the screen
+                    // was back): ask Windows to run the helper again, once, and once more whenever the screen comes back
+                    // (a monitor that took long to wake up, or was switched on). Looked at once a second.
+                    if (noted.Device != null && since.Elapsed.TotalSeconds >= look) {
+                        look = Math.Floor(since.Elapsed.TotalSeconds) + 1;
+                        bool here = Takeable(noted.Device);
+                        if (here && !asked) {
+                            asked = true;
+                            Log(noted.Device + " is on the desktop but was not freed " + since.Elapsed.TotalSeconds.ToString("0") + " s after " + (woke ? "waking up" : "the lock")
+                                + (RunTask("LockMonitor-Take") ? ": asked the helper again" : ", and the helper could not be started"));
+                        }
+                        if (!here) asked = false;
+                    }
+                    // a monitor that is off stays so for a night, say: after half a minute the note is looked at once a second
+                    Session.Wait(since.Elapsed.TotalSeconds < 30 ? 50 : 1000);
+                    continue;
+                }
+                if (freedAt < 0) {
+                    freedAt = since.Elapsed.TotalSeconds; quiet.Restart();
+                    // at the unlock the windows go out of sight until their screen is back, unless it is no longer
+                    // connected: it will not come back then, and they stay where they are
+                    string note = held;
+                    Session.Unlocking = () => { uint lo, id; int hi; Common.Address(note, out lo, out hi, out id); if (Common.OffDesktop(lo, hi, id) != null) Pix.Away(noted); };
+                }
+                freed = true;
                 Stopwatch ran = Stopwatch.StartNew();
+                int n = naps;
+                Func<bool> go = () => Session.Locked() && Session.Naps == n;
+                Pix.Fit(noted, Session.SigningIn());
                 try {
-                    Show.Pictures(held, noted, null, framesTo, Session.Locked,
-                        () => "showing " + noted.Wins.Count + " window(s) of " + noted.Device + ", " + locked.Elapsed.TotalSeconds.ToString("0.0") + " s after the lock", ref shown);
+                    Show.Pictures(held, noted, null, framesTo, go, d => "showing " + noted.Wins.Count + " window(s) of " + noted.Device + ", "
+                        + since.Elapsed.TotalSeconds.ToString("0.0") + " s after " + (woke ? "waking up" : "the lock") + " (freed after " + freedAt.ToString("0.0") + " s; " + d + ")", ref shown);
                 } catch (Exception e) {
-                    if (ran.Elapsed.TotalSeconds > 60) { fails = 0; since.Restart(); }   // it had been working: a new problem, not the old one again
+                    if (ran.Elapsed.TotalSeconds > 60) { fails = 0; quiet.Restart(); }   // it had been working: a new problem, not the old one again
                     // ask again at once for the first 20 s, without a word: Windows answers so at nearly every lock for a moment
                     // (measured, Windows 10 and 11); the delay shows in the "showing" line. After that, and for real refusals,
                     // after 2 s, 4 s, ... at most a minute, each logged: no busy loop, no flood in the log
-                    if (e is NotReady && since.Elapsed.TotalSeconds < 20) { Thread.Sleep(200); continue; }
+                    if (e is NotReady && quiet.Elapsed.TotalSeconds < 20) { Session.Wait(50); continue; }
                     fails++; Log(e is NotReady || e is InvalidOperationException ? e.Message : e.GetType().Name + ": " + e.Message);
-                    Pix.SleepWhile(Session.Locked, 1000 * Math.Min(60, 2 * fails));
+                    Pix.SleepWhile(go, 1000 * Math.Min(60, 2 * fails));
                 }
             }
+            Session.Unlocking = null;
             if (noted.Device != null || freed)   // on a single-screen desktop there is nothing to say
                 Log("lock over after " + locked.Elapsed.TotalSeconds.ToString("0") + " s, " + (shown > 0 ? shown + " picture(s)"
                     : freed ? "no picture: Windows never handed the screen over" : "no picture: the helper did not free the screen (its reasons are in switch.log next to it)"));
             Pix.LockEnded();
-            if (freed) Pix.PutBack(noted);
+            Pix.PutBack(noted);   // also after a lock that never freed the screen: windows left out of sight by the one before come back
             if (shown > 0) Pix.BrowserHint(noted);   // afterwards: it asks Windows about processes, which takes milliseconds, and the first picture comes first
         }
+    }
+
+    // The noted screen is on the desktop, with the monitor the helper keeps on it (or none is chosen yet): the helper
+    // would take it now.
+    static bool Takeable(string device) {
+        string keep = Common.Note("Keep") as string;
+        foreach (Common.Screen s in Common.Screens())
+            if (s.Device == device) return keep == null || Common.MonitorPath(s.Lo, s.Hi, s.Id) == keep;
+        return false;
+    }
+    // Have Windows run one of the setup's scheduled tasks now: the user may start them, and they do what this program has
+    // no rights to do. true when asked.
+    public static bool RunTask(string name) {
+        try {
+            ProcessStartInfo p = new ProcessStartInfo(Environment.SystemDirectory + @"\schtasks.exe", "/run /tn " + name);
+            p.UseShellExecute = false; p.CreateNoWindow = true;
+            using (Process.Start(p)) { }
+            return true;
+        } catch (Exception) { return false; }
     }
 
     // The setup's test, once per start of this program: while the PC is unlocked, the setup has the helper take the
@@ -870,8 +1069,8 @@ public static class Agent {
             Stopwatch on = Stopwatch.StartNew();
             try {
                 Show.Pictures(held, null, "LockMonitor test picture\nWhen the PC is locked, this screen keeps showing its windows.", framesTo,
-                    () => on.Elapsed.TotalSeconds < 4 && Common.Taken() != null, () => "check: the test picture is on the screen", ref shown);
-            } catch (Exception e) { why = e.Message; Thread.Sleep(e is NotReady ? 200 : 1000); }
+                    () => on.Elapsed.TotalSeconds < 4 && Common.Taken() != null, d => "check: the test picture is on the screen (" + d + ")", ref shown);
+            } catch (Exception e) { why = e.Message; Session.Wait(e is NotReady ? 50 : 1000); }
         }
         if (shown == 0) Log("check: no picture: " + why);
     }
@@ -885,6 +1084,10 @@ public static class Agent {
     static bool Near(Color c, int r, int g, int b) { return Math.Abs(c.R - r) <= 3 && Math.Abs(c.G - g) <= 3 && Math.Abs(c.B - b) <= 3; }
     static string Rgb(Color c) { return c.R + "," + c.G + "," + c.B; }
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong(IntPtr h, int index);
+    // x is somewhere above y in the stacking of the desktop's windows (2 = GW_HWNDNEXT: the next one down)
+    static bool Above(IntPtr x, IntPtr y) { for (IntPtr h = GetWindow(x, 2); h != IntPtr.Zero; h = GetWindow(h, 2)) if (h == y) return true; return false; }
     static readonly Color Orange = Color.FromArgb(200, 100, 50), Blue = Color.FromArgb(40, 60, 200), Green = Color.FromArgb(30, 160, 60);
     static Forms.Form TestWindow(int x, int y, int w, int h, Color c, bool framed) {
         Forms.Form f = new Forms.Form();
@@ -961,6 +1164,21 @@ public static class Agent {
             drawn = Pix.CaptureWindows(note, shot);
             Line("a window hidden behind another is not captured", drawn == 1, "drawn " + drawn);
             note.Wins.RemoveAt(1);
+            // at the unlock out of sight, beside every screen; in its noted place again once its screen is back
+            Rectangle vb = Pix.Visible(b.Handle), at = vb;
+            Pix.Snap trip = new Pix.Snap(); trip.Left = vb.X - 20; trip.Top = vb.Y - 30; trip.W = 640; trip.H = 400; trip.Wins.Add(Noted(b, 20, 30, vb));   // noted where it is
+            int right = Forms.SystemInformation.VirtualScreen.Right;
+            Pix.Away(trip);
+            for (int i = 0; i < 20 && at.X < right; i++) { Forms.Application.DoEvents(); Thread.Sleep(50); at = Pix.Visible(b.Handle); }
+            Rectangle away = at;
+            int found = Pix.Rescue();   // as if the program had ended there: found at its next start, and onto a screen
+            for (int i = 0; i < 20 && at.X >= right; i++) { Forms.Application.DoEvents(); Thread.Sleep(50); at = Pix.Visible(b.Handle); }
+            Rectangle rescued = at;
+            Pix.Home(trip);
+            for (int i = 0; i < 20 && at != vb; i++) { Forms.Application.DoEvents(); Thread.Sleep(50); at = Pix.Visible(b.Handle); }
+            Line("at the unlock out of sight, then in its place again", away.X > right && away.Size == vb.Size && at == vb,
+                "away at " + away.X + "," + away.Y + ", back at " + at.X + "," + at.Y + ", noted " + vb.X + "," + vb.Y);
+            Line("one left out of sight is brought back at the start", found >= 1 && rescued.Right <= right && rescued.Size == vb.Size, "found " + found + ", now at " + rescued.X + "," + rescued.Y);
             wa.W = va.Width - 40; wa.Hgt = va.Height - 30;   // as if Windows had resized it on another screen: it is asked for the noted size
             Pix.CaptureWindows(note, shot); Forms.Application.DoEvents();
             Rectangle now = Pix.Visible(a.Handle);
@@ -971,14 +1189,26 @@ public static class Agent {
             Line("a window of another size is fitted into its place", drawn == 1 && Near(fit, 200, 100, 50) && Near(outside, 0, 0, 0), "inside " + Rgb(fit) + ", outside " + Rgb(outside));
             Pix.Place(wa); Rectangle was = Pix.Visible(a.Handle);
             a.SetBounds(300, 250, 200, 150); Forms.Application.DoEvents();   // as if Windows had moved it to another screen
-            bool asked = Pix.Restore(wa); Rectangle back = Pix.Visible(a.Handle);
+            bool asked = Pix.Restore(wa, false); Rectangle back = Pix.Visible(a.Handle);
             for (int i = 0; i < 20 && back != was; i++) { Forms.Application.DoEvents(); Thread.Sleep(50); back = Pix.Visible(a.Handle); }
             Line("a window moved away is put back in its place", asked && back == was, "now " + back.X + "," + back.Y + " " + back.Width + "x" + back.Height + ", was " + was.X + "," + was.Y + " " + was.Width + "x" + was.Height);
             ShowWindow(a.Handle, 3); Forms.Application.DoEvents(); Pix.Place(wa);   // noted maximized
-            ShowWindow(a.Handle, 4); Forms.Application.DoEvents();                   // un-maximized meanwhile, as during a lock
-            asked = Pix.Restore(wa);
+            Rectangle maxed = a.Bounds;
+            ShowWindow(a.Handle, 4); Forms.Application.DoEvents(); a.Bounds = maxed;   // un-maximized during a lock, and in its place at the unlock, not maximized
+            int detour = 0; EventHandler sized = (o, e) => { if (a.Width < maxed.Width) detour++; }; a.SizeChanged += sized;
+            asked = Pix.Restore(wa, true);
             for (int i = 0; i < 20 && a.WindowState != Forms.FormWindowState.Maximized; i++) { Forms.Application.DoEvents(); Thread.Sleep(50); }
-            Line("a maximized window is maximized again", asked && a.WindowState == Forms.FormWindowState.Maximized, a.WindowState.ToString());
+            a.SizeChanged -= sized;
+            Pix.Win rec = Noted(a, 0, 0, maxed); Pix.Place(rec);   // Windows' record: un-maximized later, it goes to its own smaller place
+            Line("a maximized window is maximized again, directly", asked && a.WindowState == Forms.FormWindowState.Maximized && detour == 0 && rec.place.normal.Is(wa.place.normal),
+                a.WindowState + ", smaller on the way " + detour + " time(s), un-maximized place " + rec.place.normal.l + "," + rec.place.normal.t + " to " + rec.place.normal.r + "," + rec.place.normal.b);
+            Pix.Snap z = new Pix.Snap(); z.Wins.Add(Noted(b, 0, 0, vb)); z.Wins.Add(wa);   // noted with the small window on top
+            bool raised = Above(a.Handle, b.Handle);
+            Pix.Restack(z); Forms.Application.DoEvents();
+            Line("windows are stacked as they were again", Above(b.Handle, a.Handle), "the maximized one on top before: " + raised);
+            b.TopMost = true; Pix.Restack(z); Forms.Application.DoEvents();   // below an always-on-top one: it must not become one
+            Line("an ordinary window is not made always-on-top", (GetWindowLong(a.Handle, -20) & 8) == 0, "");
+            b.TopMost = false;
             a.Close(); b.Close();
             Line("a closed window is left out", Pix.CaptureWindows(note, shot) == 0, "");
         }

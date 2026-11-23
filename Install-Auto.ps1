@@ -6,8 +6,9 @@ What then happens at Win+L (the genuine Windows lock, not intercepted):
      screen off the desktop, using the switch behind Settings > "Remove display from desktop".
   2. LockMonitor-Agent.exe (not elevated, running since sign-in) redraws on that screen, live, the windows that were on
      it. The other screens show the normal lock screen; keyboard and mouse work there as always.
-  3. At unlock it lets go, and Windows' "unlocked" event starts Switch-LastScreen.exe -give: the screen is a normal
-     desktop screen again and your windows go back on it (Windows 11 moves them itself; on Windows 10 the agent does).
+  3. While you sign in, that screen's windows wait out of sight (so they do not show on the other screens). At unlock
+     the agent lets go, and Windows' "unlocked" event starts Switch-LastScreen.exe -give: the screen is a normal desktop
+     screen again, with its windows back in their places.
 
 Which screen: the highest-numbered one, and from then on only that very monitor. If it is switched off or unplugged
 when you lock, nothing stays on: the next screen in line never takes its place. After changing monitors, run this again.

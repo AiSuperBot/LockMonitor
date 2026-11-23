@@ -54,15 +54,11 @@ static class SwitchLastScreen {
     // The highest-numbered screen of the desktop (\\.\DISPLAYn) and the monitor behind it. Returns the number of screens.
     static int LastScreen(out uint lo, out int hi, out uint id, out string device) {
         lo = 0; hi = 0; id = 0; device = null;
-        uint np; byte[] paths = Common.Paths(2, out np);
         int best = -1; HashSet<string> screens = new HashSet<string>();
-        for (int i = 0; i < np; i++) {
-            int o = 72 * i;
-            byte[] a = Common.Ask(1, 84, BitConverter.ToUInt32(paths, o), BitConverter.ToInt32(paths, o + 4), BitConverter.ToUInt32(paths, o + 8));   // DISPLAYCONFIG_SOURCE_DEVICE_NAME: WCHAR[32] at 20
-            if (a == null) continue;
-            string name = Common.Text(a, 20, 64); screens.Add(name);
-            int n = Common.Number(name);
-            if (n > best) { best = n; device = name; lo = BitConverter.ToUInt32(paths, o + 20); hi = BitConverter.ToInt32(paths, o + 24); id = BitConverter.ToUInt32(paths, o + 28); }
+        foreach (Common.Screen s in Common.Screens()) {
+            screens.Add(s.Device);
+            int n = Common.Number(s.Device);
+            if (n > best) { best = n; device = s.Device; lo = s.Lo; hi = s.Hi; id = s.Id; }
         }
         return screens.Count;
     }
@@ -103,7 +99,7 @@ static class SwitchLastScreen {
         if (held == null) return;
         uint lo, id; int hi; string[] h = Common.Address(held, out lo, out hi, out id);
         int rc = 0;
-        for (int i = 0; i < 40; i++) {   // 10 s: the picture program lets go of the screen within a fraction of a second after the unlock
+        for (int i = 0; i < 100; i++) {   // 10 s: the picture program lets go of the screen within a fraction of a second after the unlock
             rc = Set(lo, hi, id, false);
             bool? off = Common.OffDesktop(lo, hi, id);
             if (rc == 0 || off == false) { k.DeleteValue("Taken", false); return; }
@@ -111,7 +107,7 @@ static class SwitchLastScreen {
                 Log("give: " + h[3] + " is not connected right now (error " + rc + "). It is put back as soon as it is there again");
                 return;
             }
-            Thread.Sleep(250);
+            Thread.Sleep(100);
         }
         Log("give: Windows refused to put " + h[3] + " back, error " + rc + ". It is tried again while the PC is unlocked, at the next unlock and at sign-in. By hand: Settings > System > Display > Advanced display > Remove display from desktop = Off");
     }
