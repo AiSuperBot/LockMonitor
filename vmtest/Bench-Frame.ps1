@@ -31,7 +31,7 @@ public static class BenchFrame {
     public static string[] All(int w, int h, int n) {
         GC.Collect(); GC.WaitForPendingFinalizers();
         long before = Private();
-        using (Frame f = new Frame(w, h)) {
+        using (Frame f = new Frame(w, h, Frame.Room)) {   // as at a lock
             f.Clear();
             int top, bottom; f.Changed(out top, out bottom);   // first call: all rows, and whatever state it keeps
             long held = Private();

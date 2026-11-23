@@ -20,7 +20,7 @@ public static class Bench {
     // one picture as at a lock: every noted window captured into the screen-sized frame, then the changed rows found
     static string Picture(Pix.Snap s, int n) {
         if (s == null || s.Wins.Count == 0) return "picture: no window on the screen";
-        using (Frame f = new Frame(s.W, s.H)) {
+        using (Frame f = new Frame(s.W, s.H, Frame.Room)) {   // as at a lock
             int top, bottom;
             return Time("picture: capture " + s.Wins.Count + " win", () => Pix.CaptureWindows(s, f), n) + "\n" + Time("picture: changed rows", () => f.Changed(out top, out bottom), n);
         }

@@ -32,7 +32,7 @@ function Shot($name) {
     $v = [Pix]::Visible($h)
     $s = New-Object Pix+Snap; $s.Left = $v.X; $s.Top = $v.Y; $s.W = $v.Width; $s.H = $v.Height
     $w = New-Object Pix+Win; $w.H = $h; $w.W = $v.Width; $w.Hgt = $v.Height; $s.Wins.Add($w)
-    $f = New-Object Frame($v.Width, $v.Height)
+    $f = New-Object Frame($v.Width, $v.Height, [Frame]::Room)
     $d = [Pix]::CaptureWindows($s, $f); $t = 0; $b = 0
     $p = Join-Path $Out "$name.png"; $f.Gdi.Save($p, [System.Drawing.Imaging.ImageFormat]::Png)
     $bytes = [IO.File]::ReadAllBytes($p); $hash = [BitConverter]::ToString([Security.Cryptography.MD5]::Create().ComputeHash($bytes)).Substring(0, 11)

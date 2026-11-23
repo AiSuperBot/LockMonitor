@@ -205,6 +205,9 @@ public static class Pwr {   // ES_CONTINUOUS 0x80000000 | ES_SYSTEM_REQUIRED 1 |
 // One picture, kept as a plain Windows bitmap (DIB section): window pictures are copied into it by Windows' own bitmap
 // routines and the GPU reads it from there, with no conversions in between. Gdi is a System.Drawing view of the same
 // memory, for text; made when first asked for, as it loads GDI+, which the windows' pictures do not need.
+// With a margin (Room: the screen's picture), the bitmap is that much larger on every side and the picture is its middle
+// (Bits, Stride, and Dc, whose origin is moved there), so that a window can be drawn straight into its place with its
+// invisible borders (see View and Pix.Blit).
 public class Frame : IDisposable {
     [StructLayout(LayoutKind.Sequential)] struct BITMAPINFOHEADER { public int size, width, height; public short planes, bitCount; public int compression, sizeImage, xppm, yppm, clrUsed, clrImportant; }
     [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFOHEADER bmi, uint usage, out IntPtr bits, IntPtr section, uint offset);
@@ -214,20 +217,58 @@ public class Frame : IDisposable {
     [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
     [DllImport("gdi32.dll")] static extern bool PatBlt(IntPtr dc, int x, int y, int w, int h, uint rop);
     [DllImport("gdi32.dll")] static extern bool GdiFlush();
+    [DllImport("gdi32.dll")] static extern bool SetViewportOrgEx(IntPtr dc, int x, int y, IntPtr old);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateFileMapping(IntPtr file, IntPtr sa, uint protect, uint sizeHigh, uint sizeLow, string name);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
 
-    public readonly int W, H, Stride;
+    public const int Room = 32;   // more than any window's invisible border: 7 to 8 px at 100% scaling, about 15 at 200%
+    public readonly int W, H, Stride, Margin;
     public readonly IntPtr Bits, Dc;
-    IntPtr dib, old; Bitmap gdi; ulong[] sums; bool gone;
+    IntPtr section, dib, old, view, viewDc, viewOld; long viewAt = -1; int viewRows; Bitmap gdi; ulong[] sums; bool gone;
 
-    public Frame(int w, int h) {
-        W = w; H = h; Stride = w * 4;
-        BITMAPINFOHEADER bi = new BITMAPINFOHEADER(); bi.size = 40; bi.width = w; bi.height = -h; bi.planes = 1; bi.bitCount = 32;   // negative height: first row on top
-        dib = CreateDIBSection(IntPtr.Zero, ref bi, 0, out Bits, IntPtr.Zero, 0);
-        if (dib == IntPtr.Zero) throw new OutOfMemoryException("no memory for a " + w + "x" + h + " picture");
+    public Frame(int w, int h, int margin = 0) {
+        W = w; H = h; Margin = margin; Stride = (w + 2 * margin) * 4;
+        int rows = h + 2 * margin;
+        if (margin > 0) {   // in memory of its own that View can map a second time; one row more for a view that starts within the last one
+            long size = (long)Stride * (rows + 1);
+            section = CreateFileMapping(new IntPtr(-1), IntPtr.Zero, 4, (uint)(size >> 32), (uint)size, null);   // 4 = PAGE_READWRITE, page-file backed
+            if (section == IntPtr.Zero) throw new OutOfMemoryException("no memory for a " + w + "x" + h + " picture");
+        }
+        BITMAPINFOHEADER bi = Header(w + 2 * margin, rows); IntPtr all;
+        dib = CreateDIBSection(IntPtr.Zero, ref bi, 0, out all, section, 0);
+        if (dib == IntPtr.Zero) { if (section != IntPtr.Zero) CloseHandle(section); throw new OutOfMemoryException("no memory for a " + w + "x" + h + " picture"); }
+        Bits = all + margin * Stride + margin * 4;
         Dc = CreateCompatibleDC(IntPtr.Zero); old = SelectObject(Dc, dib);
+        if (margin > 0) SetViewportOrgEx(Dc, margin, margin, IntPtr.Zero);
+    }
+    static BITMAPINFOHEADER Header(int w, int h) {   // 32 bits a pixel; negative height: first row on top
+        BITMAPINFOHEADER bi = new BITMAPINFOHEADER(); bi.size = 40; bi.width = w; bi.height = -h; bi.planes = 1; bi.bitCount = 32; return bi;
     }
     public Bitmap Gdi { get { return gdi ?? (gdi = new Bitmap(W, H, Stride, PixelFormat.Format32bppRgb, Bits)); } }
-    public void Clear() { PatBlt(Dc, 0, 0, W, H, 0x42); }   // 0x42 = BLACKNESS
+    public void Clear() { Black(0, 0, W, H); }
+    public void Black(int x, int y, int w, int h) { if (w > 0 && h > 0) PatBlt(Dc, x, y, w, h, 0x42); }   // 0x42 = BLACKNESS
+
+    // A DC for drawing a window's picture straight into the picture: PrintWindow always draws at the top-left corner of the
+    // bitmap, whatever the DC's origin (measured), so this is a second bitmap over the same memory, whose corner is at x, y
+    // of the picture, and rows tall. As wide as a row of the whole bitmap: what is drawn must end within the margin, or it
+    // would run on into the next row. Zero where the margin does not reach.
+    public IntPtr View(int x, int y, int rows) {
+        if (x < -Margin || y < -Margin) return IntPtr.Zero;
+        if (section == IntPtr.Zero) return IntPtr.Zero;
+        long at = (long)(Margin + y) * Stride + (Margin + x) * 4;
+        if (at != viewAt || rows != viewRows) {   // kept for the next picture: the same window is usually in the same place
+            DropView();
+            BITMAPINFOHEADER bi = Header(Stride / 4, rows); IntPtr bits;
+            view = CreateDIBSection(IntPtr.Zero, ref bi, 0, out bits, section, (uint)at);
+            if (view == IntPtr.Zero) return IntPtr.Zero;
+            viewDc = CreateCompatibleDC(IntPtr.Zero); viewOld = SelectObject(viewDc, view); viewAt = at; viewRows = rows;
+        }
+        return viewDc;
+    }
+    void DropView() {
+        if (view == IntPtr.Zero) return;
+        SelectObject(viewDc, viewOld); DeleteDC(viewDc); DeleteObject(view); view = viewDc = IntPtr.Zero; viewAt = -1;
+    }
 
     // The rows that differ from the picture at the previous call, as [top, bottom); false when none do (the first call
     // reports all rows); only these rows need to go to the GPU. Each row is known by a fingerprint of its pixels, 8 bytes
@@ -239,9 +280,9 @@ public class Frame : IDisposable {
         bool all = sums == null;
         if (all) sums = new ulong[H];
         top = H; bottom = 0;
-        byte* row = (byte*)Bits;
+        byte* row = (byte*)Bits; int n = W * 4;   // the picture's part of each row, not the margin
         for (int y = 0; y < H; y++, row += Stride) {
-            ulong s = Sum(row, Stride);
+            ulong s = Sum(row, n);
             if (all || s != sums[y]) { sums[y] = s; if (top == H) top = y; bottom = y + 1; }
         }
         return top < bottom;
@@ -269,7 +310,9 @@ public class Frame : IDisposable {
     public void Dispose() {
         if (gone) return; gone = true;
         if (gdi != null) gdi.Dispose();
+        DropView();
         SelectObject(Dc, old); DeleteDC(Dc); DeleteObject(dib);
+        if (section != IntPtr.Zero) CloseHandle(section);
     }
 }
 
@@ -547,19 +590,24 @@ public static class Pix {
     // draws fine although the setting was written again since (measured), and from outside the two look the same.
     public static void BrowserHint(Snap s) {
         string[][] browsers = { new[] { "chrome", @"SOFTWARE\Policies\Google\Chrome", "Chrome", "chrome://restart" }, new[] { "msedge", @"SOFTWARE\Policies\Microsoft\Edge", "Edge", "edge://restart" } };
-        foreach (string[] b in browsers) {
-            DateTime set = PolicySince(b[1]);
-            if (set == DateTime.MinValue) continue;
-            foreach (Win w in s.Wins) {
-                uint pid; GetWindowThreadProcessId(w.H, out pid);
-                try {
-                    using (Process p = Process.GetProcessById((int)pid))
-                        if (string.Equals(p.ProcessName, b[0], StringComparison.OrdinalIgnoreCase) && p.StartTime < set) {
-                            Agent.Log(b[2] + " has been running since " + p.StartTime.ToString("G") + ", longer than its setting to keep drawing while the PC is locked (made " + set.ToString("G") + "): if its page was dark or frozen during the lock, restart it once (" + b[3] + " in its address bar)");
-                            break;
+        DateTime[] set = new DateTime[browsers.Length]; bool any = false;
+        for (int i = 0; i < browsers.Length; i++) any |= (set[i] = PolicySince(browsers[i][1])) != DateTime.MinValue;
+        if (!any) return;
+        List<uint> seen = new List<uint>();
+        foreach (Win w in s.Wins) {
+            uint pid; GetWindowThreadProcessId(w.H, out pid);
+            if (pid == 0 || seen.Contains(pid)) continue;   // each process once: .NET lists all processes to name one
+            seen.Add(pid);
+            try {
+                using (Process p = Process.GetProcessById((int)pid)) {
+                    string name = p.ProcessName;
+                    for (int i = 0; i < browsers.Length; i++)
+                        if (set[i] != DateTime.MinValue && string.Equals(name, browsers[i][0], StringComparison.OrdinalIgnoreCase) && p.StartTime < set[i]) {
+                            Agent.Log(browsers[i][2] + " has been running since " + p.StartTime.ToString("G") + ", longer than its setting to keep drawing while the PC is locked (made " + set[i].ToString("G") + "): if its page was dark or frozen during the lock, restart it once (" + browsers[i][3] + " in its address bar)");
+                            set[i] = DateTime.MinValue;   // said once
                         }
-                } catch (Exception) { }   // closed meanwhile, or a process this program may not ask about
-            }
+                }
+            } catch (Exception) { }   // closed meanwhile, or a process this program may not ask about
         }
     }
     // When the browser's policy WindowOcclusionEnabled = 0 was last written (its key's time); MinValue if it is not set.
@@ -611,14 +659,30 @@ public static class Pix {
     // 2 = PW_RENDERFULLCONTENT: the picture comes from the window compositor, so GPU-drawn apps (Chrome) work and the
     // window may be covered by others. Measured: it keeps delivering fresh pictures while locked. Measured too: it
     // always draws the whole window at the top-left corner of the bitmap, ignoring the DC's origin and clipping. Hence
-    // the detour through a bitmap of its own, from which the visible part is copied into place; only a window without
-    // invisible borders that is exactly the whole picture (a full-screen browser) can be drawn straight into it.
-    static bool Blit(Win win, Frame dst) {
+    // the detour through a bitmap of its own (scratch), from which the visible part is copied into place. Not for the
+    // first window drawn (first: the bottom-most) when it needs no fitting and its invisible borders fit into the
+    // picture's margin: it is drawn straight into its place (Frame.View) and its borders are blackened where they fell
+    // into the picture, on black, as nothing is below it. That saves a copy of it per picture, and a scratch as large as
+    // the screen when it is a maximized window (8 MB at 1920x1080).
+    // clear: the picture still has to be black wherever no window is (no window covers all of it). The first window does
+    // that: all around its visible part when it went straight in, which blackens its borders too and saves a pass over the
+    // whole picture (a maximized window leaves only the taskbar's band), else the whole picture before it is drawn.
+    static bool Blit(Win win, Frame dst, bool first, ref bool clear) {
         int x = win.bx, y = win.by, w = win.bw, h = win.bh;
         RECT whole = win.whole, seen = win.seen;
         int ww = whole.r - whole.l, wh = whole.b - whole.t, fx = seen.l - whole.l, fy = seen.t - whole.t, fw = seen.r - seen.l, fh = seen.b - seen.t;
         bool exact = fw == w && fh == h;
-        if (exact && fw == ww && fh == wh && x == 0 && y == 0 && w == dst.W && h == dst.H) return PrintWindow(win.H, dst.Dc, 2);
+        if (first && exact && x - fx + ww <= dst.W + dst.Margin && y - fy + wh <= dst.H + dst.Margin) {
+            IntPtr dc = dst.View(x - fx, y - fy, wh);
+            if (dc != IntPtr.Zero && PrintWindow(win.H, dc, 2)) {
+                if (clear) {   // above, below, left and right of the visible part; one covering the picture has its borders outside it
+                    dst.Black(0, 0, dst.W, y); dst.Black(0, y + h, dst.W, dst.H - y - h); dst.Black(0, y, x, h); dst.Black(x + w, y, dst.W - x - w, h);
+                    clear = false;
+                }
+                return true;
+            }
+        }
+        if (clear) { dst.Clear(); clear = false; }
         if (scratch == null || scratch.W < ww || scratch.H < wh) {   // kept between pictures, grown when a bigger window comes along
             int nw = Math.Max(ww, scratch == null ? 0 : scratch.W), nh = Math.Max(wh, scratch == null ? 0 : scratch.H);
             Frame old = scratch; scratch = null; if (old != null) old.Dispose();   // never left pointing at a freed bitmap, should the new one fail
@@ -650,12 +714,13 @@ public static class Pix {
             Arrange(w, s, hide);
             if (full < 0 && w.Exact && w.bx <= 0 && w.by <= 0 && w.bx + w.bw >= dst.W && w.by + w.bh >= dst.H) full = i;
         }
-        if (full < 0) dst.Clear();
-        int drawn = 0;
+        int drawn = 0; bool first = true, clear = full < 0;   // see Blit
         for (int i = full >= 0 ? full : s.Wins.Count - 1; i >= 0; i--) {   // bottom-most first
             if (!s.Wins[i].live || Hidden(s, i)) continue;
-            if (Blit(s.Wins[i], dst)) drawn++;
+            if (Blit(s.Wins[i], dst, first, ref clear)) drawn++;
+            first = false;
         }
+        if (clear) dst.Clear();   // no window was there to draw
         GdiFlush();
         return drawn;
     }
@@ -712,6 +777,7 @@ public static class Pix {
     // The newest note may have been made while the lock was already starting: go on from the one known to be good.
     // And do not sit on a screen-sized bitmap until the next lock.
     public static void LockEnded() { latest = noted; if (scratch != null) { scratch.Dispose(); scratch = null; } }
+    internal static bool Scratched { get { return scratch != null; } }   // for the self-test
 
     // Sleeps ms, but returns false as soon as go says stop: at an unlock the screen must go back without delay (an
     // unlock, a sleep or a wake-up end the wait at once; go is looked at every 250 ms besides).
@@ -978,7 +1044,7 @@ public static class Show {
                 }
             }
             if (!Pwr.Keep(true)) Agent.Log("Windows refused the request to keep the displays on: the picture may go dark with them");
-            frame = new Frame(w, hgt);
+            frame = new Frame(w, hgt, Frame.Room);
             int i = 0, still = 0, top, bottom; bool first = true, said = false;
             int[] staleTop = { 0, 0 }, staleBottom = { hgt, hgt };   // the rows each of the two surfaces still lacks: all of them at first
             while (go()) {
@@ -1104,6 +1170,7 @@ public static class Agent {
                     gaveAt = -1;
                     if (held == null) {   // taken again, as at a lock (freedAt, fails: found in review); the displays may have gone dark meanwhile
                         asked = RunTask("LockMonitor-Take"); Pwr.Wake(); freedAt = -1; fails = 0;
+                        foreach (Pix.Win w in noted.Wins) w.Asked = 0;   // Windows moves and shrinks them again (found in review)
                         Log("the sign-in screen went without an unlock: " + (asked ? "asked the helper to take " + noted.Device + " again" : "the helper could not be started"));
                     }
                 }
@@ -1259,14 +1326,18 @@ public static class Agent {
 
         // the picture path, against windows of our own in known colours
         using (Forms.Form a = TestWindow(60, 60, 320, 200, Orange, true), b = TestWindow(120, 100, 120, 90, Blue, true))
-        using (Frame shot = new Frame(640, 400)) {
+        using (Frame shot = new Frame(640, 400, Frame.Room)) {
             Settle(a); Settle(b);
             Rectangle va = Pix.Visible(a.Handle);
             Pix.Snap note = new Pix.Snap(); note.W = 640; note.H = 400;
             Pix.Win wa = Noted(a, 100, 50, va); note.Wins.Add(wa);
+            Pix.LockEnded();   // no scratch bitmap: the one window must be drawn straight into its place
+            Pix.Notice(shot, "under the window");   // and what was there before must be black again all around it
             int drawn = Pix.CaptureWindows(note, shot), top, bottom;
-            Color inside = shot.Gdi.GetPixel(100 + va.Width / 2, 50 + va.Height - 12), left = shot.Gdi.GetPixel(96, 50 + va.Height - 12), below = shot.Gdi.GetPixel(100 + va.Width / 2, 50 + va.Height + 4);
-            Line("window redrawn in its place, pixel for pixel", drawn == 1 && Near(inside, 200, 100, 50) && Near(left, 0, 0, 0) && Near(below, 0, 0, 0), "inside " + Rgb(inside) + ", left " + Rgb(left) + ", below " + Rgb(below));
+            Color inside = shot.Gdi.GetPixel(100 + va.Width / 2, 50 + va.Height - 12), left = shot.Gdi.GetPixel(96, 50 + va.Height - 12), below = shot.Gdi.GetPixel(100 + va.Width / 2, 50 + va.Height + 4),
+                corners = Color.FromArgb(shot.Gdi.GetPixel(2, 2).ToArgb() | shot.Gdi.GetPixel(637, 397).ToArgb() | shot.Gdi.GetPixel(637, 2).ToArgb() | shot.Gdi.GetPixel(2, 397).ToArgb());
+            Line("window redrawn in its place, pixel for pixel", drawn == 1 && !Pix.Scratched && Near(inside, 200, 100, 50) && Near(left, 0, 0, 0) && Near(below, 0, 0, 0) && Near(corners, 0, 0, 0),
+                "inside " + Rgb(inside) + ", left " + Rgb(left) + ", below " + Rgb(below) + ", corners " + Rgb(corners) + (Pix.Scratched ? ", copied through a scratch bitmap" : ", drawn straight in"));
             Line("an unchanged picture is recognised", shot.Changed(out top, out bottom) && Pix.CaptureWindows(note, shot) == 1 && !shot.Changed(out top, out bottom), "");
             shot.Gdi.SetPixel(10, 123, Color.White);
             bool band = shot.Changed(out top, out bottom) && top == 123 && bottom == 124;
@@ -1276,6 +1347,12 @@ public static class Agent {
             drawn = Pix.CaptureWindows(note, shot);
             Line("a window hidden behind another is not captured", drawn == 1, "drawn " + drawn);
             note.Wins.RemoveAt(1);
+            // one above it, overlapping it: copied over it without its invisible borders, which must not blacken the one below
+            Rectangle vb0 = Pix.Visible(b.Handle);
+            Pix.Snap pair = new Pix.Snap(); pair.W = 640; pair.H = 400; pair.Wins.Add(Noted(b, 350, 150, vb0)); pair.Wins.Add(Noted(a, 100, 50, va));
+            drawn = Pix.CaptureWindows(pair, shot);
+            Color onTop = shot.Gdi.GetPixel(350 + vb0.Width / 2, 150 + vb0.Height / 2), beside = shot.Gdi.GetPixel(347, 150 + vb0.Height / 2);
+            Line("a window above another is drawn over it", drawn == 2 && Near(onTop, 40, 60, 200) && Near(beside, 200, 100, 50), "inside " + Rgb(onTop) + ", beside " + Rgb(beside));
             // at the unlock out of sight, beside every screen; in its noted place again once its screen is back
             Rectangle vb = Pix.Visible(b.Handle), at = vb;
             Pix.Snap trip = new Pix.Snap(); trip.Left = vb.X - 20; trip.Top = vb.Y - 30; trip.W = 640; trip.H = 400; trip.Wins.Add(Noted(b, 20, 30, vb));   // noted where it is
@@ -1327,7 +1404,7 @@ public static class Agent {
         using (Forms.Form c = TestWindow(0, 0, 640, 400, Green, false)) {   // borderless, like a full-screen browser
             Settle(c);
             Rectangle vc = Pix.Visible(c.Handle);
-            using (Frame shot = new Frame(vc.Width, vc.Height)) {
+            using (Frame shot = new Frame(vc.Width, vc.Height, Frame.Room)) {
                 Pix.Snap note = new Pix.Snap(); note.W = vc.Width; note.H = vc.Height; note.Wins.Add(Noted(c, 0, 0, vc));
                 Pix.Notice(shot, "under the window");   // something in the picture already: the window must cover all of it
                 int drawn = Pix.CaptureWindows(note, shot);

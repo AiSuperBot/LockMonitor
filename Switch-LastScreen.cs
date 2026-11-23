@@ -67,8 +67,7 @@ static class SwitchLastScreen {
         string held = k.GetValue("Taken") as string, keep = k.GetValue("Keep") as string;
         uint lo, id; int hi; string device;
         if (held != null) {
-            string[] h = Common.Address(held, out lo, out hi, out id);
-            bool? off = Common.OffDesktop(lo, hi, id);
+            bool? off; string[] h = Common.Address(held, out lo, out hi, out id, out off);
             // the note is stale if the screen was put back by hand meanwhile, or is gone and no longer the one to keep (monitors changed, setup run again)
             if (off == false || (off == null && h.Length > 4 && h[4] != keep)) k.DeleteValue("Taken", false);
             else { Log("take: already holding " + h[3]); return; }

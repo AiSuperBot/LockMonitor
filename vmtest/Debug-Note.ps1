@@ -10,6 +10,6 @@ $s = [Pix]::Snapshot($null)
 if (-not $s) { 'Snapshot: null (single screen)'; return }
 "screen $($s.Device) $($s.W)x$($s.H), windows: $($s.Wins.Count)"
 $s.Wins | ForEach-Object { '  hwnd 0x{0:X} at {1},{2} size {3}x{4}  "{5}"' -f $_.H.ToInt64(), $_.X, $_.Y, $_.W, $_.Hgt, $_.Title }
-$f = New-Object Frame($s.W, $s.H)
+$f = New-Object Frame($s.W, $s.H, [Frame]::Room)   # as at a lock
 "drawn: $([Pix]::CaptureWindows($s, $f))"
 $f.Gdi.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png); "saved $Out"

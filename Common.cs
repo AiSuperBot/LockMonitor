@@ -10,8 +10,8 @@ using Microsoft.Win32;
 
 // shown in each file's Properties > Details; the agent also logs it at every start
 [assembly: AssemblyProduct("LockMonitor")]
-[assembly: AssemblyVersion("0.2.11")]
-[assembly: AssemblyFileVersion("0.2.11")]
+[assembly: AssemblyVersion("0.2.12")]
+[assembly: AssemblyFileVersion("0.2.12")]
 
 public static class Common {
     [DllImport("wtsapi32.dll")] static extern bool WTSQuerySessionInformation(IntPtr server, int session, int infoClass, out IntPtr buf, out int bytes);
@@ -87,14 +87,17 @@ public static class Common {
     // any more: the screen is then found again by its monitor path, as the same target on whichever adapter answers with
     // that path. Measured in the test VM: without this, such a screen stayed off the desktop for good. Both programs go
     // through this: the agent too, or it would look for the screen under the old numbers.
-    public static string[] Address(string note, out uint lo, out int hi, out uint id) {
+    // off: whether it is off the desktop there now (see OffDesktop), asked on the way.
+    public static string[] Address(string note, out uint lo, out int hi, out uint id) { bool? off; return Address(note, out lo, out hi, out id, out off); }
+    public static string[] Address(string note, out uint lo, out int hi, out uint id, out bool? off) {
         string[] h = Parse(note, out lo, out hi, out id);
-        if (h.Length < 5 || h[4].Length == 0 || OffDesktop(lo, hi, id) != null) return h;
+        off = OffDesktop(lo, hi, id);
+        if (off != null || h.Length < 5 || h[4].Length == 0) return h;
         uint np; byte[] paths = Paths(1, out np); HashSet<long> tried = new HashSet<long>();
         for (int i = 0; i < np; i++) {   // every adapter shows up in the list of all paths, even when its screen itself is hidden from it
             long luid = BitConverter.ToInt64(paths, 72 * i);
             if (!tried.Add(luid)) continue;
-            if (MonitorPath((uint)luid, (int)(luid >> 32), id) == h[4]) { lo = (uint)luid; hi = (int)(luid >> 32); break; }
+            if (MonitorPath((uint)luid, (int)(luid >> 32), id) == h[4]) { lo = (uint)luid; hi = (int)(luid >> 32); off = OffDesktop(lo, hi, id); break; }
         }
         return h;
     }
@@ -114,7 +117,7 @@ public static class Common {
         return f == null ? (bool?)null : (f & 1) != 0;
     }
     // the same for the screen of a "Taken" note, wherever it is now (see Address)
-    public static bool? OffDesktop(string note) { uint lo, id; int hi; Address(note, out lo, out hi, out id); return OffDesktop(lo, hi, id); }
+    public static bool? OffDesktop(string note) { uint lo, id; int hi; bool? off; Address(note, out lo, out hi, out id, out off); return off; }
     public static string Describe(uint lo, int hi, uint id) {
         uint? f = Specialization(lo, hi, id);
         if (f != null) return "off the desktop: " + Yes(f, 1) + "; can be handed to a program: this monitor " + Yes(f, 2) + ", this Windows " + Yes(f, 4);
