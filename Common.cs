@@ -10,8 +10,8 @@ using Microsoft.Win32;
 
 // shown in each file's Properties > Details; the agent also logs it at every start
 [assembly: AssemblyProduct("LockMonitor")]
-[assembly: AssemblyVersion("0.2.10")]
-[assembly: AssemblyFileVersion("0.2.10")]
+[assembly: AssemblyVersion("0.2.11")]
+[assembly: AssemblyFileVersion("0.2.11")]
 
 public static class Common {
     [DllImport("wtsapi32.dll")] static extern bool WTSQuerySessionInformation(IntPtr server, int session, int infoClass, out IntPtr buf, out int bytes);
