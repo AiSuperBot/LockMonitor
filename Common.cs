@@ -10,8 +10,8 @@ using Microsoft.Win32;
 
 // shown in each file's Properties > Details; the agent also logs it at every start
 [assembly: AssemblyProduct("LockMonitor")]
-[assembly: AssemblyVersion("0.2.12")]
-[assembly: AssemblyFileVersion("0.2.12")]
+[assembly: AssemblyVersion("0.2.13")]
+[assembly: AssemblyFileVersion("0.2.13")]
 
 public static class Common {
     [DllImport("wtsapi32.dll")] static extern bool WTSQuerySessionInformation(IntPtr server, int session, int infoClass, out IntPtr buf, out int bytes);
@@ -24,10 +24,8 @@ public static class Common {
         if (!WTSQuerySessionInformation(IntPtr.Zero, -1, 25, out p, out n)) return -1;
         int f = Marshal.ReadInt32(p, 16); WTSFreeMemory(p); return f;
     }
-    // Two definite answers; when Windows cannot say, both are false. Holding a screen and drawing on it takes a definite
-    // "locked"; asking for a held screen to be put back takes a definite "unlocked".
+    // A definite answer; false when Windows cannot say: taking a screen takes a definite "locked".
     public static bool Locked() { return SessionFlag() == 0; }
-    public static bool Unlocked() { return SessionFlag() == 1; }
 
     [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo([In, Out] byte[] request);
     // A DisplayConfig device-info request: header (type, size, adapter LUID, target id); the rest is filled in by the

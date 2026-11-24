@@ -75,7 +75,7 @@ public static class Session {
     static volatile int news;        // counts announcements: an answer asked for before the latest one is older than it
     static volatile bool told;       // announcements arrive
     static long asked;               // Stopwatch time of the last answer
-    static long lockedAt;            // Stopwatch time of the latest lock announcement or wake-up (see SigningIn)
+    static long lockedAt;            // Stopwatch time of the latest lock announcement
     static int naps;                 // counts the moments the PC went to sleep or woke up
     static volatile bool asleep;     // between "goes to sleep" and "woke up"
     static readonly WndProc proc = Announced;   // kept alive: Windows calls these as long as the program runs
@@ -108,7 +108,7 @@ public static class Session {
             // a picture taken meanwhile treats the windows as during the sign-in: it would call them back otherwise
             if (what == 8) Interlocked.Exchange(ref signing, Stopwatch.GetTimestamp());
             if (what == 8 && a != null) try { a(); } catch (Exception) { }   // must not end this thread
-            if (what == 7) { Interlocked.Exchange(ref lockedAt, Stopwatch.GetTimestamp()); curtain = false; }
+            if (what == 7) Interlocked.Exchange(ref lockedAt, Stopwatch.GetTimestamp());
             if (what == 8) asleep = false;   // awake, whatever the power notices said (not at a lock: one comes with a sleep)
             flag = what == 7 ? 0 : what == 8 ? 1 : -1; news++; Interlocked.Exchange(ref asked, Stopwatch.GetTimestamp());
             changed.Set();
@@ -120,9 +120,6 @@ public static class Session {
     static uint Power(IntPtr context, uint type, IntPtr setting) {
         if (type == 4 || type == 0x12) {   // PBT_APMSUSPEND: about to sleep; PBT_APMRESUMEAUTOMATIC: woke up
             asleep = type == 4; Interlocked.Increment(ref naps);
-            // a wake-up may pass through the sign-in desktop as a lock does, and nobody need be there: as at a lock, a sign-in
-            // counts only once the lock screen's own picture was up again (found in reviews)
-            if (!asleep) { Interlocked.Exchange(ref lockedAt, Stopwatch.GetTimestamp()); curtain = false; }
             changed.Set();
             if (asleep) Free.WaitOne(1500);   // Windows allows about 2 s for this answer
         }
@@ -170,20 +167,19 @@ public static class Session {
     // goes a moment before Windows says the PC is unlocked (measured). Not in the first 3 s of a lock: the lock itself
     // passes through that desktop (measured: for 0.7 s).
     static long signing;   // Stopwatch time the sign-in screen was last seen, or the unlock announced
-    static volatile bool curtain;   // the lock screen's own picture was up during this lock
     public static bool SigningIn() {
-        long now = Stopwatch.GetTimestamp(), at = Interlocked.Read(ref lockedAt);
-        if (now - at >= 3 * Stopwatch.Frequency) {
+        long now = Stopwatch.GetTimestamp();
+        if (now - Interlocked.Read(ref lockedAt) >= 3 * Stopwatch.Frequency) {
             IntPtr d = OpenInputDesktop(0, false, 0x0001);   // DESKTOP_READOBJECTS
-            if (d == IntPtr.Zero) Interlocked.Exchange(ref signing, now); else { CloseDesktop(d); curtain = true; }
+            if (d == IntPtr.Zero) Interlocked.Exchange(ref signing, now); else CloseDesktop(d);
         }
-        return NearUnlock && Interlocked.Read(ref signing) > at;   // not the unlock before this lock (locked again at once)
+        return NearUnlock;
     }
-    // The user is back: the sign-in screen came up over the lock screen's own picture. Not a sign-in screen that is up
-    // all through the lock, as with the policy "Do not display the lock screen" (found in review): it is the lock screen.
-    public static bool UserBack() { return SigningIn() && curtain; }
-    // the same as last said, without asking Windows: true from the unlock announcement on, also amid a picture
-    public static bool NearUnlock { get { return Stopwatch.GetTimestamp() - Interlocked.Read(ref signing) < 2 * Stopwatch.Frequency; } }
+    // the same as last said, without asking Windows: true from the unlock announcement on, also amid a picture; not for
+    // the unlock before this lock (locked again at once)
+    public static bool NearUnlock {
+        get { long s = Interlocked.Read(ref signing); return Stopwatch.GetTimestamp() - s < 2 * Stopwatch.Frequency && s > Interlocked.Read(ref lockedAt); }
+    }
     public static int Naps { get { return Thread.VolatileRead(ref naps); } }
     // between "about to sleep" and "woke up" (or the next unlock, should the wake-up go unsaid)
     public static bool Asleep { get { return asleep; } }
@@ -451,7 +447,7 @@ public static class Pix {
     // nobody sees the desktop while the PC is locked. Nobody but the user who unlocks it: Windows shows the screens behind
     // its "Welcome" before the unlock (measured: the kept screen's windows flashed there). So while the sign-in screen is
     // up (hide), they are asked out of sight instead, beside every screen, and put into their place once their screen is
-    // back (see Agent.Loop). Not out of sight all through the lock: there most windows stop drawing (measured on Windows 10:
+    // back (see PutBack). Not out of sight all through the lock: there most windows stop drawing (measured on Windows 10:
     // a classic window, and a Chrome that draws without the GPU). It asks without waiting (0x4000), so a window that does
     // not answer cannot hold the pictures up; at least half a second apart so that a slow app has the time to answer, and
     // for its size at most 3 times: one that will not take it is fitted instead. Calling one back from out of sight (the
@@ -493,7 +489,7 @@ public static class Pix {
     // Every noted window into its noted place and size, or at x if given; on whatever thread hears of the unlock, so with
     // outlines of its own: the pictures may be looking at the same windows. Into its place, one that is maximized already
     // is left so (measured: Windows 11 had maximized it there again); PutBack sees to one maximized elsewhere. One that is
-    // there already is not asked again: this runs every quarter second behind the sign-in screen (see Agent.Loop).
+    // there already is not asked again.
     public static void Home(Snap s, int x = int.MinValue) {
         foreach (Win w in s.Wins) {
             RECT whole = new RECT(), seen = new RECT();
@@ -503,7 +499,7 @@ public static class Pix {
         }
     }
     // The screen is on the desktop (again).
-    public static bool Listed(string device) { foreach (KeyValuePair<IntPtr, MONITORINFOEX> m in Monitors()) if (m.Value.device == device) return true; return false; }
+    static bool Listed(string device) { foreach (KeyValuePair<IntPtr, MONITORINFOEX> m in Monitors()) if (m.Value.device == device) return true; return false; }
 
     // After the screen was held (a lock, or the setup's test), once the helper has put it back: every noted window goes
     // into its noted place at once, then every one that is not on that screen, or not maximized again although it was,
@@ -1130,13 +1126,13 @@ public static class Agent {
         for (;;) {
             Pix.Snap noted = Pix.WaitForLock(!checkedOnce);
             if (noted.Check) { checkedOnce = true; Check(framesTo); Pix.PutBack(noted); continue; }
+            foreach (Pix.Win w in noted.Wins) w.Asked = 0;   // a lock right after the last one has the same note (found in review)
             // since: the lock, or the PC's latest wake-up during it; quiet: how long Windows' "not ready" goes unsaid (below)
             Stopwatch locked = Stopwatch.StartNew(), since = Stopwatch.StartNew(), quiet = Stopwatch.StartNew();
-            // gaveAt: when the screen was given back for the sign-in screen (below), -1 when it was not
-            int naps = Session.Naps, fails = 0, shown = 0, dozes = 0; bool freed = false, woke = false, asked = false; double freedAt = -1, look = 3, gaveAt = -1;
+            int naps = Session.Naps, fails = 0, shown = 0, dozes = 0; bool freed = false, woke = false, asked = false; double freedAt = -1, look = 3;
             while (Session.Locked()) {
                 if (naps != Session.Naps) {   // the PC is about to sleep, or woke up: from the start again (Show lets go of the screen meanwhile)
-                    naps = Session.Naps; since.Restart(); fails = 0; dozes = 0; woke = true; asked = false; freedAt = -1; look = 3; gaveAt = -1;
+                    naps = Session.Naps; since.Restart(); fails = 0; dozes = 0; woke = true; asked = false; freedAt = -1; look = 3;
                     foreach (Pix.Win w in noted.Wins) w.Asked = 0;   // the screens may have changed sizes meanwhile
                 }
                 // Nothing while the PC goes to sleep: at most 30 waits, counted rather than timed, should the wake-up go
@@ -1148,32 +1144,12 @@ public static class Agent {
                     // a lock that came while the displays were dark (an automatic one) would leave them so (see Pwr); not
                     // after a wake-up, which Windows also makes by itself (for updates at night, say), with nobody there
                     if (!woke) Pwr.Wake();
-                    // at the unlock the windows go out of sight until their screen is back, unless it is back already
-                    // (below) or no longer connected: it will not come back then, and they stay where they are
+                    // at the unlock the windows go out of sight until their screen is back, unless it is not off the
+                    // desktop (no longer connected, say: it will not come back then, and they stay where they are)
                     string note = held;
                     Session.Unlocking = () => { if (Common.OffDesktop(note) == true) Pix.Away(noted); };
                 }
-                // The user is back, the sign-in screen up: the screen goes back to the desktop now, behind it, not after the unlock.
-                // Its return makes Windows drop the taskbar's room on the other screens for a moment, so that their
-                // maximized windows change size: three times in a row when it came back after the unlock, once behind
-                // the sign-in screen and once at the unlock (measured; Windows gives the room back only then). Its windows
-                // go into their place once it is on the desktop, out of sight until then. Not when it is no longer
-                // connected: it could not come back.
-                if (Session.UserBack()) {
-                    if (held != null && gaveAt < 0 && Common.OffDesktop(held) == true) { gaveAt = since.Elapsed.TotalSeconds; RunTask("LockMonitor-Give"); }
-                    if (noted.Device != null && Pix.Listed(noted.Device)) Pix.Home(noted);
-                    else if (gaveAt >= 0) Pix.Fit(noted, true);
-                    Session.Wait(250); continue;
-                }
-                if (gaveAt >= 0) {   // given back for a sign-in screen that went without an unlock
-                    if (held != null && since.Elapsed.TotalSeconds - gaveAt < 12) { Session.Wait(250); continue; }   // still being put back (the helper allows 10 s)
-                    gaveAt = -1;
-                    if (held == null) {   // taken again, as at a lock (freedAt, fails: found in review); the displays may have gone dark meanwhile
-                        asked = RunTask("LockMonitor-Take"); Pwr.Wake(); freedAt = -1; fails = 0;
-                        foreach (Pix.Win w in noted.Wins) w.Asked = 0;   // Windows moves and shrinks them again (found in review)
-                        Log("the sign-in screen went without an unlock: " + (asked ? "asked the helper to take " + noted.Device + " again" : "the helper could not be started"));
-                    }
-                }
+                // shown until the unlock, the sign-in screen included (the user's choice; see README on the other screens)
                 if (held == null) {
                     // The helper frees the screen within a second of a lock. Not so 3 s after a lock or a wake-up, although
                     // the screen is on the desktop (the lock came with a sleep, say, and the helper ran before the screen
@@ -1195,8 +1171,10 @@ public static class Agent {
                 }
                 Stopwatch ran = Stopwatch.StartNew();
                 int n = naps;
-                Func<bool> go = () => Session.Locked() && Session.Naps == n && !Session.UserBack();
-                Pix.Fit(noted, Session.SigningIn());
+                Func<bool> go = () => Session.Locked() && Session.Naps == n;
+                // out of sight while signing in only when the screen can come back: once it is unplugged or switched off,
+                // its windows belong on the other screen (found in review: they vanished there for 10 s after the unlock)
+                Pix.Fit(noted, Session.SigningIn() && Common.OffDesktop(held) == true);
                 try {
                     Show.Pictures(held, noted, null, framesTo, go, d => "showing " + noted.Wins.Count + " window(s) of " + noted.Device + ", "
                         + since.Elapsed.TotalSeconds.ToString("0.0") + " s after " + (woke ? "waking up" : "the lock") + " (freed after " + freedAt.ToString("0.0") + " s; " + d + ")", ref shown);

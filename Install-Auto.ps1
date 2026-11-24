@@ -6,10 +6,10 @@ What then happens at Win+L (the genuine Windows lock, not intercepted):
      screen off the desktop, using the switch behind Settings > "Remove display from desktop".
   2. LockMonitor-Agent.exe (not elevated, running since sign-in) redraws on that screen, live, the windows that were on
      it. The other screens show the normal lock screen; keyboard and mouse work there as always.
-  3. When the password box appears, the agent lets go and has the LockMonitor-Give task put the screen back on the
-     desktop, behind the sign-in screen, its windows back in their places; taken again if the sign-in screen goes
-     without a sign-in. Windows' "unlocked" event starts Switch-LastScreen.exe -give as well, for a sign-in too quick
-     for that. A screen saver with "On resume, display logon screen" is turned into this lock after its grace period.
+  3. While you sign in, that screen's windows wait out of sight (so they do not show on the other screens). At unlock
+     the agent lets go, and Windows' "unlocked" event starts Switch-LastScreen.exe -give: the screen is a normal desktop
+     screen again, with its windows back in their places. A screen saver with "On resume, display logon screen" is
+     turned into this lock after its grace period.
 
 Which screen: the highest-numbered one, and from then on only that very monitor. If it is switched off or unplugged
 when you lock, nothing stays on: the next screen in line never takes its place. After changing monitors, run this again.
