@@ -71,6 +71,33 @@ The highest-numbered screen (`\\.\DISPLAYn`), and from then on only that very mo
 - Logs: `%LOCALAPPDATA%\LockMonitor\log.txt` has two lines per lock (what is shown, how long after the lock and after the screen was freed; how long the lock lasted and how many pictures), often a third (how many windows were put back), a line when a screen saver was turned into a lock, a hint when Chrome or Edge may need its one restart, plus anything that went wrong. `%ProgramFiles%\LockMonitor\switch.log` has only what was out of the ordinary. Nothing about how you signed in is recorded.
 - `"%ProgramFiles%\LockMonitor\LockMonitor-Agent.exe" -selftest | more` checks the PC's graphics and window capture without changing anything.
 
+## Connecting from another PC (Remote Desktop)
+
+A normal Remote Desktop connection (`mstsc /v:<your PC>`) moves your session off the PC's own monitors: Windows 10 and 11 show one interactive session at a time, so while you are connected the PC's monitors show Windows' sign-in screen and the kept monitor has nothing to show. After you disconnect, your session stays off the monitors until someone signs in at the PC. Putting it back by itself (`tscon`) is not an option: a session that was locked came back unlocked, with no password asked (measured, in a Windows 10 test machine), so LockMonitor never does that.
+
+To keep the session where it is, connect to it as a shadow session instead:
+
+```
+mstsc /v:<your PC> /shadow:<session number> /control /noConsentPrompt
+```
+
+You then see and use the PC's own screen. Press Win+L before you close the window, and the kept monitor shows its windows again, as after any Win+L at the PC.
+
+What goes where:
+
+- `/v:<your PC>` is the PC's name or IP address, as you would type it in a normal Remote Desktop connection: `/v:OFFICE-PC` or `/v:192.168.1.20`.
+- `/shadow:<session number>` is the number of the session to join: the one of the user who is signed in at the PC. Run `qwinsta` on the PC and take the number from the ID column, in the row with your user name. It is often `1`, but it changes after a sign-out and sign-in, so look it up. A number, not a name: `/shadow:1`.
+- `/control` lets you type and click in it. Without it you can only watch.
+- `/noConsentPrompt` does not ask the person at the PC for permission. Without it, a question appears on the PC and the connection waits until someone there accepts, so with nobody there it does not connect. It works only with the policy below set to "Full Control without user's permission".
+
+Set up once on the PC, as administrator:
+
+1. Switch Remote Desktop on (Settings > System > Remote Desktop), and check that the firewall rule "Remote Desktop - Shadow (TCP-In)" is enabled (Windows Defender Firewall with Advanced Security > Inbound Rules); switching Remote Desktop on normally enables it.
+2. Allow shadowing without a prompt. In the Local Group Policy Editor (`gpedit.msc`), under Computer Configuration > Administrative Templates > Windows Components > Remote Desktop Services > Remote Desktop Session Host > Connections, set "Set rules for remote control of Remote Desktop Services user sessions" to Enabled, with the option "Full Control without user's permission". The same from an elevated Command Prompt: `reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v Shadow /t REG_DWORD /d 2 /f`. (With the option "Full Control with user's permission", value 1, someone at the PC has to accept: leave `/noConsentPrompt` out then.)
+3. Connect with an account that is an administrator on the PC.
+
+Mind that while you work like this, the PC's own monitors show your unlocked desktop to anyone in the room, and that with this policy every administrator of the PC can watch and control its screen without a prompt.
+
 ## Tested and not tested
 
 Tested in a VMware guest (Windows 11 Enterprise LTSC 2024), with real key presses and the real password:
@@ -99,6 +126,7 @@ Not tested:
 - sleep on real hardware: the virtual machines offer standby S1 only, not S3 or Modern Standby, and their display adapter cannot show the picture itself
 - a kept monitor that is turned to portrait: the picture is not turned with it
 - whether the number Windows Settings shows for a monitor equals its `\\.\DISPLAYn` number on your PC (the test picture shows which monitor it is)
+- the `mstsc /shadow` connection above: the test machines have no network, so only the disconnect and the return to the console were measured (and the names of the policy, its registry value and the firewall rule were checked against Windows' own policy files)
 
 ## Build
 
